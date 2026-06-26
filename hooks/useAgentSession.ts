@@ -103,6 +103,14 @@ export interface AttachedImage {
   previewUrl: string;
 }
 
+export interface AttachedFile {
+  name: string;
+  size: number;
+  type: string;
+  data?: string;
+  isText?: boolean;
+}
+
 type SelectedModel = { provider: string; modelId: string };
 type ModelEntry = { id: string; name: string; provider: string };
 type ModelsResponse = {
@@ -371,16 +379,44 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [loadSession, onAgentEnd]);
   handleAgentEventRef.current = handleAgentEvent;
 
-  const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
-    if (!message.trim() && !images?.length) return;
+  const handleSend = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
+    if (!message.trim() && !images?.length && !files?.length) return;
     if (agentRunning) return;
 
     const imageBlocks = images?.map((img) => ({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } }));
+    
+    // Process file attachments into content blocks
+    const fileContent: string[] = [];
+    if (files?.length) {
+      for (const file of files) {
+        if (file.isText && file.data) {
+          // Text files: include content as a code block
+          const ext = file.name.split('.').pop()?.toLowerCase() || '';
+          const langMap: Record<string, string> = {
+            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
+            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
+            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
+            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
+            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
+            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
+          };
+          const lang = langMap[ext] || '';
+          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
+        } else {
+          // Binary files: just mention the file
+          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
+        }
+      }
+    }
+    
+    // Combine message with file content
+    const fullMessage = message.trim() + fileContent.join('');
+    
     const userMsg: AgentMessage = {
       role: "user",
       content: imageBlocks?.length
-        ? [...(message.trim() ? [{ type: "text" as const, text: message }] : []), ...imageBlocks]
-        : message,
+        ? [...(fullMessage.trim() ? [{ type: "text" as const, text: fullMessage }] : []), ...imageBlocks]
+        : fullMessage,
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, userMsg]);
@@ -405,7 +441,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           body: JSON.stringify({
             cwd: newSessionCwd,
             type: "prompt",
-            message,
+            message: fullMessage,
             toolNames,
             ...(piImages?.length ? { images: piImages } : {}),
             ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
@@ -431,7 +467,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         connectEvents(session.id);
         await sendAgentCommand(session.id, {
           type: "prompt",
-          message,
+          message: fullMessage,
           ...(piImages?.length ? { images: piImages } : {}),
         });
       }
@@ -525,15 +561,39 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [isCompacting, loadSession]);
 
-  const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleSteer = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${message}`, timestamp: Date.now() } as AgentMessage]);
+    
+    // Process file attachments
+    const fileContent: string[] = [];
+    if (files?.length) {
+      for (const file of files) {
+        if (file.isText && file.data) {
+          const ext = file.name.split('.').pop()?.toLowerCase() || '';
+          const langMap: Record<string, string> = {
+            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
+            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
+            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
+            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
+            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
+            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
+          };
+          const lang = langMap[ext] || '';
+          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
+        } else {
+          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
+        }
+      }
+    }
+    
+    const fullMessage = `[steer] ${message}${fileContent.join('')}`;
+    setMessages((prev) => [...prev, { role: "user", content: fullMessage, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "steer",
-        message,
+        message: fullMessage,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
@@ -541,15 +601,39 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    setMessages((prev) => [...prev, { role: "user", content: message, timestamp: Date.now() } as AgentMessage]);
+    
+    // Process file attachments
+    const fileContent: string[] = [];
+    if (files?.length) {
+      for (const file of files) {
+        if (file.isText && file.data) {
+          const ext = file.name.split('.').pop()?.toLowerCase() || '';
+          const langMap: Record<string, string> = {
+            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
+            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
+            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
+            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
+            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
+            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
+          };
+          const lang = langMap[ext] || '';
+          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
+        } else {
+          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
+        }
+      }
+    }
+    
+    const fullMessage = `${message}${fileContent.join('')}`;
+    setMessages((prev) => [...prev, { role: "user", content: fullMessage, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "follow_up",
-        message,
+        message: fullMessage,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
