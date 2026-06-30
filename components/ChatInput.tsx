@@ -9,6 +9,14 @@ export interface AttachedImage {
   previewUrl: string; // object URL for display
 }
 
+export interface AttachedFile {
+  name: string;
+  size: number;
+  type: string; // mime type
+  data?: string; // text content for text files
+  isText?: boolean;
+}
+
 interface ModelOption {
   provider: string;
   modelId: string;
@@ -16,10 +24,10 @@ interface ModelOption {
 }
 
 interface Props {
-  onSend: (message: string, images?: AttachedImage[]) => void;
+  onSend: (message: string, images?: AttachedImage[], files?: AttachedFile[]) => void;
   onAbort: () => void;
-  onSteer?: (message: string, images?: AttachedImage[]) => void;
-  onFollowUp?: (message: string, images?: AttachedImage[]) => void;
+  onSteer?: (message: string, images?: AttachedImage[], files?: AttachedFile[]) => void;
+  onFollowUp?: (message: string, images?: AttachedImage[], files?: AttachedFile[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
   model?: { provider: string; modelId: string } | null;
@@ -51,6 +59,7 @@ export interface ChatInputHandle {
   insertText: (text: string) => void;
   insertIfEmpty: (text: string) => void;
   addImages: (files: File[]) => void;
+  addFiles: (files: File[]) => void;
 }
 
 const TOOL_PRESETS = ["off", "default", "full"] as const;
@@ -190,6 +199,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     addImages(files: File[]) {
       processImageFiles(files);
     },
+    addFiles(files: File[]) {
+      processDroppedFiles(files);
+    },
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
@@ -230,28 +242,113 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, []);
 
+  // File attachment state and handlers
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+
+  const isTextFile = useCallback((file: File): boolean => {
+    const textTypes = [
+      'text/', 'application/json', 'application/xml', 'application/javascript',
+      'application/typescript', 'application/x-javascript', 'application/x-typescript',
+      'application/x-sh', 'application/x-yaml', 'application/x-toml',
+    ];
+    const textExtensions = [
+      '.txt', '.md', '.mdx', '.json', '.jsonl', '.xml', '.yaml', '.yml', '.toml',
+      '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+      '.py', '.pyw', '.pyi', '.rb',
+      '.java', '.kt', '.scala', '.groovy',
+      '.go', '.rs', '.swift', '.m', '.h', '.hpp',
+      '.c', '.cc', '.cpp', '.cxx', '.cs',
+      '.html', '.htm', '.css', '.scss', '.sass', '.less',
+      '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+      '.sql', '.graphql', '.gql', '.proto',
+      '.dockerfile', '.makefile', '.cmake',
+      '.env', '.gitignore', '.editorconfig',
+      '.csv', '.tsv', '.log', '.ini', '.cfg', '.conf',
+      '.tex', '.latex', '.bib',
+      '.r', '.lua', '.pl', '.php',
+      '.vue', '.svelte', '.astro',
+      '.prisma', '.schema',
+    ];
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    return textTypes.some(t => file.type.startsWith(t)) || textExtensions.includes(ext);
+  }, []);
+
+  const processDroppedFiles = useCallback(async (files: File[]) => {
+    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+    const otherFiles = files.filter((f) => !f.type.startsWith("image/"));
+
+    // Process images
+    if (imageFiles.length > 0) {
+      await processImageFiles(imageFiles);
+    }
+
+    // Process other files
+    const newFiles: AttachedFile[] = [];
+    const MAX_TEXT_SIZE = 500 * 1024; // 500KB limit for text files
+    for (const file of otherFiles) {
+      const attachedFile: AttachedFile = {
+        name: file.name,
+        size: file.size,
+        type: file.type || 'application/octet-stream',
+      };
+
+      if (isTextFile(file) && file.size <= MAX_TEXT_SIZE) {
+        try {
+          const content = await file.text();
+          attachedFile.data = content;
+          attachedFile.isText = true;
+        } catch {
+          attachedFile.isText = false;
+        }
+      }
+
+      newFiles.push(attachedFile);
+    }
+
+    if (newFiles.length > 0) {
+      setAttachedFiles((prev) => [...prev, ...newFiles]);
+    }
+  }, [processImageFiles, isTextFile]);
+
+  const removeFile = useCallback((index: number) => {
+    setAttachedFiles((prev) => {
+      const next = [...prev];
+      next.splice(index, 1);
+      return next;
+    });
+  }, []);
+
+  const clearFiles = useCallback(() => {
+    setAttachedFiles([]);
+  }, []);
+
   const clearInput = useCallback(() => {
     setValue("");
     clearImages();
+    clearFiles();
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearImages]);
+  }, [clearImages, clearFiles]);
 
   const handleSend = useCallback(async () => {
     const msg = value.trim();
-    if (!msg && !attachedImages.length) return;
+    if (!msg && !attachedImages.length && !attachedFiles.length) return;
     if (isStreaming) return;
-    if (!attachedImages.length && msg.startsWith("/") && onBuiltinCommand) {
+    if (!attachedImages.length && !attachedFiles.length && msg.startsWith("/") && onBuiltinCommand) {
       const result = await onBuiltinCommand(msg);
       if (result.handled) {
         if (!result.error) clearInput();
         return;
       }
     }
-    onSend(msg, attachedImages.length ? attachedImages : undefined);
+    onSend(
+      msg,
+      attachedImages.length ? attachedImages : undefined,
+      attachedFiles.length ? attachedFiles : undefined
+    );
     clearInput();
-  }, [value, attachedImages, isStreaming, onBuiltinCommand, onSend, clearInput]);
+  }, [value, attachedImages, attachedFiles, isStreaming, onBuiltinCommand, onSend, clearInput]);
 
   const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
@@ -318,14 +415,23 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       return;
     }
     if (mode === "steer" && onSteer) {
-      onSteer(msg, attachedImages.length ? attachedImages : undefined);
+      onSteer(
+        msg,
+        attachedImages.length ? attachedImages : undefined,
+        attachedFiles.length ? attachedFiles : undefined
+      );
     } else if (mode === "followup" && onFollowUp) {
-      onFollowUp(msg, attachedImages.length ? attachedImages : undefined);
+      onFollowUp(
+        msg,
+        attachedImages.length ? attachedImages : undefined,
+        attachedFiles.length ? attachedFiles : undefined
+      );
     }
     setValue("");
     clearImages();
+    clearFiles();
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-  }, [value, attachedImages, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearImages]);
+  }, [value, attachedImages, attachedFiles, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearImages, clearFiles]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = filteredSlashCommands.length - 1;
@@ -446,6 +552,45 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     processImageFiles(files);
   }, [processImageFiles]);
 
+  // Drag and drop handlers
+  const dragCounterRef = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current++;
+    if (e.dataTransfer.types.includes("Files")) {
+      setIsDragging(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragging(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current = 0;
+    setIsDragging(false);
+
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      processDroppedFiles(files);
+    }
+  }, [processDroppedFiles]);
+
   useEffect(() => {
     if (slashQuery === null) {
       setSlashMenuOpen(false);
@@ -537,23 +682,60 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
   return (
     <div
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
       style={{
         flexShrink: 0,
-        background: "transparent",
+        background: isDragging ? "rgba(59,130,246,0.05)" : "transparent",
         padding: "0 16px 8px",
         paddingRight: 52, // 16px base + 36px for ChatMinimap alignment
+        transition: "background 0.15s",
+        position: "relative",
       }}
     >
+      {/* Drag overlay */}
+      {isDragging && (
+        <div style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "rgba(59,130,246,0.08)",
+          border: "2px dashed rgba(59,130,246,0.5)",
+          borderRadius: 16,
+          zIndex: 100,
+          pointerEvents: "none",
+          margin: "0 16px",
+        }}>
+          <div style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 8,
+          }}>
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(59,130,246,0.7)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span style={{ color: "rgba(59,130,246,0.8)", fontSize: 14, fontWeight: 500 }}>
+              拖放文件到这里
+            </span>
+          </div>
+        </div>
+      )}
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*"
         multiple
         style={{ display: "none" }}
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
-          processImageFiles(files);
+          processDroppedFiles(files);
           e.target.value = "";
         }}
       />
@@ -605,6 +787,56 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     background: "var(--bg-panel)", border: "1px solid var(--border)",
                     display: "flex", alignItems: "center", justifyContent: "center",
                     cursor: "pointer", padding: 0, color: "var(--text-muted)",
+                  }}
+                >
+                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <line x1="1" y1="1" x2="7" y2="7" /><line x1="7" y1="1" x2="1" y2="7" />
+                  </svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* File previews */}
+        {attachedFiles.length > 0 && (
+          <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+            {attachedFiles.map((file, i) => (
+              <div
+                key={i}
+                style={{
+                  position: "relative",
+                  flexShrink: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 10px",
+                  background: file.isText ? "rgba(59,130,246,0.08)" : "rgba(249,115,22,0.08)",
+                  border: `1px solid ${file.isText ? "rgba(59,130,246,0.2)" : "rgba(249,115,22,0.2)"}`,
+                  borderRadius: 6,
+                  fontSize: 12,
+                  color: "var(--text)",
+                  maxWidth: 200,
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, color: file.isText ? "rgba(59,130,246,0.8)" : "rgba(249,115,22,0.8)" }}>
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                </svg>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {file.name}
+                </span>
+                <span style={{ fontSize: 10, color: "var(--text-dim)", flexShrink: 0 }}>
+                  {file.size > 1024 ? `${Math.round(file.size / 1024)}KB` : `${file.size}B`}
+                </span>
+                <button
+                  onClick={() => removeFile(i)}
+                  style={{
+                    position: "absolute", top: -4, right: -4,
+                    width: 16, height: 16, borderRadius: "50%",
+                    background: "var(--bg-panel)", border: "1px solid var(--border)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    cursor: "pointer", padding: 0, color: "var(--text-muted)",
+                    flexShrink: 0,
                   }}
                 >
                   <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
