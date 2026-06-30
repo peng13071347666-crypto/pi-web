@@ -56,7 +56,14 @@ export async function GET(req: Request) {
     if (provider && modelId && available.some((m) => m.provider === provider && m.id === modelId)) {
       defaultModel = { provider, modelId };
     }
-  } catch { /* return empty */ }
+  } catch (e) {
+    // Log the real cause so it's visible in the server console. Previously
+    // this was `catch { /* return empty */ }` which silently hid version-mismatch
+    // parse failures (e.g. models.json written by a newer pi than pi-web bundles).
+    // The /api/version-check banner surfaces the version diagnosis; here we at
+    // least keep the stack trace reachable for debugging.
+    console.error("[api/models] failed to load model registry:", e);
+  }
 
   return Response.json({ models: Object.fromEntries(nameMap), modelList, defaultModel, thinkingLevels, thinkingLevelMaps });
 }

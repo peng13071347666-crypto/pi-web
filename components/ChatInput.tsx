@@ -46,6 +46,7 @@ interface Props {
   availableThinkingLevels?: string[] | null;
   thinkingLevelMap?: Record<string, string | null> | null;
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
+  slashCommands?: { name: string; description: string; source: string }[];
   soundEnabled?: boolean;
   onSoundToggle?: () => void;
 }
@@ -89,7 +90,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   onSend, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, onModelChange,
   onCompact, onAbortCompaction, isCompacting, compactError, compactResult, toolPreset, onToolPresetChange,
   thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
-  retryInfo,
+  retryInfo, slashCommands,
   soundEnabled, onSoundToggle,
 }: Props, ref) {
   const [value, setValue] = useState("");
@@ -101,6 +102,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const dragCounterRef = useRef(0);
+
+  // Slash-command autocomplete state. Shown when the input starts with "/".
+  // Commands come from useAgentSession (extension commands + templates + skills).
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [cmdHighlight, setCmdHighlight] = useState(0);
+  const cmdListRef = useRef<HTMLDivElement>(null);
 
   // Check if file is text-based
   const isTextFile = (file: File): boolean => {
@@ -310,6 +317,48 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   }, [value, attachedImages, attachedFiles, onSteer, onFollowUp, clearImages]);
 
+  // Filtered slash commands for autocomplete. Only active when the input
+  // starts with "/" and has no whitespace yet (i.e. user is still typing the
+  // command name). Once they type a space we hide the picker so they can type
+  // args normally.
+  const filteredCmds = (() => {
+    const v = value;
+    if (!v.startsWith("/")) return [];
+    const spaceIdx = v.indexOf(" ");
+    if (spaceIdx !== -1) return [];
+    const query = v.slice(1).toLowerCase();
+    const list = slashCommands ?? [];
+    const filtered = query
+      ? list.filter((c) => c.name.toLowerCase().includes(query))
+      : list;
+    // Sort: commands whose name starts with the query first, then alphabetical.
+    return filtered.slice().sort((a, b) => {
+      const as = a.name.toLowerCase().startsWith(query);
+      const bs = b.name.toLowerCase().startsWith(query);
+      if (as !== bs) return as ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    }).slice(0, 12);
+  })();
+
+  useEffect(() => {
+    setCmdOpen(filteredCmds.length > 0);
+    setCmdHighlight(0);
+  }, [value, slashCommands]); // filteredCmds derived from value+slashCommands
+
+  const pickCommand = useCallback((cmd: { name: string }) => {
+    setValue(`/${cmd.name} `);
+    setCmdOpen(false);
+    requestAnimationFrame(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      const pos = ta.value.length;
+      ta.setSelectionRange(pos, pos);
+      ta.style.height = "auto";
+      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+    });
+  }, []);
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
       const nativeEvent = e.nativeEvent;
@@ -318,6 +367,41 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         isComposingRef.current ||
         nativeEvent.isComposing ||
         nativeEvent.keyCode === 229;
+
+      // Slash-command autocomplete navigation (only when picker is open and
+      // the user is not composing).
+      if (cmdOpen && filteredCmds.length > 0 && !isComposing) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setCmdHighlight((h) => (h + 1) % filteredCmds.length);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setCmdHighlight((h) => (h - 1 + filteredCmds.length) % filteredCmds.length);
+          return;
+        }
+        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+          // Tab / Enter picks the highlighted command when the picker is open.
+          // Enter only picks if the current input is a bare command name (no args
+          // yet) — otherwise Enter should send. We treat "starts with / and no
+          // space" as the picking zone.
+          const bare = value.startsWith("/") && value.indexOf(" ") === -1;
+          if (e.key === "Tab" || bare) {
+            e.preventDefault();
+            const pick = filteredCmds[cmdHighlight];
+            if (pick) {
+              pickCommand(pick);
+              return;
+            }
+          }
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setCmdOpen(false);
+          return;
+        }
+      }
 
       if (e.key === "Enter" && !e.shiftKey && (isComposing || recentlyComposed)) {
         if (recentlyComposed) e.preventDefault();
@@ -334,7 +418,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
     },
-    [isStreaming, onSteer, onFollowUp, sendQueued, handleSend]
+    [isStreaming, onSteer, onFollowUp, sendQueued, handleSend, cmdOpen, filteredCmds, cmdHighlight, value, pickCommand]
   );
 
   const handleInput = useCallback(() => {
@@ -358,7 +442,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     e.preventDefault();
     e.stopPropagation();
     dragCounterRef.current++;
-    console.log('Drag enter, counter:', dragCounterRef.current, 'types:', e.dataTransfer.types);
     if (e.dataTransfer.types.includes("Files")) {
       setIsDragging(true);
     }
@@ -383,10 +466,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     e.stopPropagation();
     dragCounterRef.current = 0;
     setIsDragging(false);
-    console.log('Drop event, files:', e.dataTransfer.files.length);
 
     const files = Array.from(e.dataTransfer.files);
-    console.log('Processing files:', files.map(f => f.name));
     if (files.length > 0) {
       processDroppedFiles(files);
     }
@@ -417,7 +498,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const displayModelName = model
     ? (modelOptions.find((o) => o.modelId === model.modelId && o.provider === model.provider)?.name ?? model.modelId)
     : null;
-  const currentName = displayModelName;
+  const currentName = displayModelName ?? (modelOptions.length > 0 ? "Select model…" : null);
 
   const compactSavedTokens = compactResult
     ? Math.max(0, compactResult.tokensBefore - compactResult.estimatedTokensAfter)
@@ -656,7 +737,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 : isStreaming && (onSteer || onFollowUp)
                 ? "Steer 立即注入 / Follow-up 排队…"
                 : isStreaming ? "Agent is running…"
-                : "Message…"
+                : "Message…  (输入 / 列出可用命令)"
             }
             rows={1}
             style={{
@@ -755,6 +836,82 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           )}
         </div>
 
+        {/* Slash-command autocomplete */}
+        {cmdOpen && filteredCmds.length > 0 && (
+          <div ref={cmdListRef} style={{
+            maxWidth: 820,
+            margin: "0 auto",
+            position: "relative",
+          }}>
+            <div style={{
+              position: "absolute",
+              bottom: "calc(100% + 4px)",
+              left: 0,
+              right: 0,
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
+              overflow: "hidden",
+              zIndex: 400,
+              maxHeight: 280,
+              overflowY: "auto",
+            }}>
+              <div style={{
+                padding: "5px 10px",
+                fontSize: 10,
+                color: "var(--text-dim)",
+                borderBottom: "1px solid var(--border)",
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+                background: "var(--bg-panel)",
+              }}>
+                命令 (↑↓ 选择 · Tab/Enter 补全 · Esc 关闭)
+              </div>
+              {filteredCmds.map((cmd, i) => {
+                const active = i === cmdHighlight;
+                const sourceColor = cmd.source === "extension"
+                  ? "rgba(129,140,248,0.9)"
+                  : cmd.source === "skill"
+                  ? "rgba(16,185,129,0.9)"
+                  : "rgba(234,179,8,0.9)";
+                return (
+                  <button
+                    key={`${cmd.source}:${cmd.name}`}
+                    onMouseEnter={() => setCmdHighlight(i)}
+                    onClick={() => pickCommand(cmd)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      width: "100%",
+                      padding: "7px 12px",
+                      background: active ? "var(--bg-selected)" : "none",
+                      border: "none",
+                      color: active ? "var(--text)" : "var(--text-muted)",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      textAlign: "left",
+                      fontWeight: active ? 600 : 400,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <span style={{ fontFamily: "var(--font-mono)", color: sourceColor, fontSize: 11, flexShrink: 0 }}>
+                      /{cmd.name}
+                    </span>
+                    <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", color: "var(--text-dim)", fontWeight: 400 }}>
+                      {cmd.description || "(无描述)"}
+                    </span>
+                    <span style={{ fontSize: 10, color: "var(--text-dim)", flexShrink: 0, textTransform: "uppercase" }}>
+                      {cmd.source}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Bottom bar: left | center (context) | right */}
         <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6 }}>
 
@@ -788,8 +945,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
               </svg>
             </button>
-            {/* Model selector — visible always, disabled during streaming */}
-            {modelOptions.length > 0 && currentName && onModelChange && (
+            {/* Model selector — visible whenever models are available */}
+            {modelOptions.length > 0 && onModelChange && (
                 <div ref={dropdownRef} style={{ position: "relative" }}>
                   <button
                     onClick={(e) => {

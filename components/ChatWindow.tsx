@@ -94,7 +94,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   const {
     loading, error, messages, entryIds, streamState,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
-    retryInfo, contextUsage, forkingEntryId,
+    retryInfo, contextUsage, forkingEntryId, slashCommands,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, sessionStats,
     isAutoModelSelection,
     agentPhase,
@@ -200,6 +200,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
       availableThinkingLevels={availableThinkingLevels}
       thinkingLevelMap={currentThinkingLevelMap}
       retryInfo={retryInfo}
+      slashCommands={slashCommands}
       soundEnabled={soundEnabled}
       onSoundToggle={onSoundToggle}
     />

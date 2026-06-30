@@ -15,7 +15,6 @@ export async function POST(req: Request) {
     const args = ["skills", "add", pkg.trim(), "-y", "--agent", "pi"];
     if (isGlobal) args.push("-g");
 
-    console.log(`[skills/install] running: npx ${args.join(" ")}`);
     const { stdout, stderr } = await runNpx(args, {
       timeout: 60000,
       cwd: !isGlobal && cwd ? cwd : undefined,
@@ -29,8 +28,14 @@ export async function POST(req: Request) {
     }
     return NextResponse.json({ success: true, output });
   } catch (e: unknown) {
-    const err = e as { stdout?: string; stderr?: string; message?: string };
+    const err = e as { stdout?: string; stderr?: string; message?: string; code?: number | string };
     const output = ((err.stdout ?? "") + (err.stderr ?? "")).replace(ANSI_RE, "");
-    return NextResponse.json({ error: output || (err.message ?? String(e)) }, { status: 500 });
+    const msg = output || (err.message ?? String(e)).trim();
+    if (msg.includes("ENOENT") && process.platform === "win32") {
+      return NextResponse.json({
+        error: `Unable to run npx. Please ensure Node.js and npm are correctly installed. (${msg})`,
+      }, { status: 500 });
+    }
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

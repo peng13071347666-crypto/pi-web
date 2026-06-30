@@ -541,7 +541,7 @@ export function SkillsConfig({
 
   useEffect(() => {
     loadSkills();
-  }, [cwd]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loadSkills]);
 
   const toggle = useCallback(async (skill: Skill) => {
     const next = !skill.disableModelInvocation;

@@ -1,5 +1,10 @@
 import type { SessionManager, SettingsManager, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 
+export interface AgentEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
 export interface ContextUsage {
   percent: number | null;
   contextWindow: number;
@@ -22,6 +27,11 @@ export interface NavigateTreeResult {
   aborted?: boolean;
 }
 
+export interface ExtensionRunner {
+  onError: (listener: (error: AgentEvent) => void) => () => void;
+  getRegisteredCommands: () => Array<{ invocationName: string; description?: string }>;
+}
+
 export interface AgentSessionLike {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
@@ -34,6 +44,8 @@ export interface AgentSessionLike {
   readonly sessionManager: SessionManager;
   readonly settingsManager: SettingsManager;
   readonly agent: { state?: { systemPrompt?: string; thinkingLevel?: string } };
+  readonly resourceLoader: { getSkills: () => { skills: { name: string; description?: string }[] } };
+  readonly promptTemplates: ReadonlyArray<{ name: string; description?: string }>;
 
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string, options?: { images?: Array<{ type: "image"; data: string; mimeType: string }> }): Promise<void>;

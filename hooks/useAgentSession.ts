@@ -149,6 +149,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [forkingEntryId, setForkingEntryId] = useState<string | null>(null);
+  const [slashCommands, setSlashCommands] = useState<{ name: string; description: string; source: string }[]>([]);
   const [currentModelOverride, setCurrentModelOverride] = useState<{ provider: string; modelId: string } | null>(null);
   const [pendingModel, setPendingModel] = useState<{ provider: string; modelId: string } | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
@@ -255,6 +256,40 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [setToolPresetState]);
 
+  // Slash commands for the ChatInput autocomplete. Two sources merged:
+  //   - /api/commands?cwd=...  (prompt templates + skills, no session needed)
+  //   - get_commands via RPC    (adds extension commands when a session is live)
+  // We fetch the static list on cwd change and augment with session commands
+  // whenever the session id changes.
+  const loadCommands = useCallback(async (sid?: string, cwd?: string) => {
+    const staticList: { name: string; description: string; source: string }[] = [];
+    if (cwd) {
+      try {
+        const res = await fetch(`/api/commands?cwd=${encodeURIComponent(cwd)}`);
+        if (res.ok) {
+          const data = (await res.json()) as { commands?: { name: string; description: string; source: string }[] };
+          if (data.commands) staticList.push(...data.commands);
+        }
+      } catch { /* ignore */ }
+    }
+    if (sid) {
+      try {
+        const sessionCmds = await sendAgentCommand<{ name: string; description: string; source: string }[]>(sid, { type: "get_commands" });
+        if (Array.isArray(sessionCmds)) {
+          // Merge: session list includes extension commands + templates + skills.
+          // Prefer the session list when available (it has extension commands).
+          const seen = new Set<string>();
+          const merged = [...sessionCmds, ...staticList].filter((c) =>
+            seen.has(c.name) ? false : (seen.add(c.name), true),
+          );
+          setSlashCommands(merged);
+          return;
+        }
+      } catch { /* session not running yet — fall back to static list */ }
+    }
+    setSlashCommands(staticList);
+  }, []);
+
   const connectEvents = useCallback((sid: string) => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
@@ -358,6 +393,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "auto_retry_end":
         setRetryInfo(null);
         break;
+      case "extension_error": {
+        // Extension command / skill expansion failures surface here. Without
+        // this, typing a bad /command silently does nothing (the command handler
+        // catches the error and emits this event, but the agent loop never runs,
+        // so there's no agent_end to clear the "running" state). We surface the
+        // error as a compact tool-style message so the user sees what went wrong.
+        const errMsg = (event.error as string | undefined) ?? "Extension error";
+        const extPath = (event.extensionPath as string | undefined) ?? "extension";
+        console.error(`[extension_error] ${extPath}:`, errMsg);
+        setMessages((prev) => [...prev, {
+          role: "toolResult",
+          toolCallId: `ext-${Date.now()}`,
+          content: [{ type: "text", text: `Extension error (${extPath}): ${errMsg}` }],
+          isError: true,
+          timestamp: Date.now(),
+        } as import("@/lib/types").AgentMessage]);
+        break;
+      }
       case "auto_compaction_start":
       case "compaction_start":
         setIsCompacting(true);
@@ -463,6 +516,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           messageCount: 1,
           firstMessage: message,
         });
+        // Session now exists — fetch the full command list (incl. extension commands)
+        loadCommands(realId, newSessionCwd);
       } else if (session) {
         connectEvents(session.id);
         await sendAgentCommand(session.id, {
@@ -718,6 +773,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             connectEvents(session.id);
           }
         }
+        // Load slash commands (session-bound list includes extension commands)
+        loadCommands(session.id, session.cwd);
         if (agentState?.state) {
           if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
           if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
@@ -806,6 +863,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => controller.abort();
   }, [isNew, modelsRefreshKey, newSessionCwd, session?.cwd]);
 
+  // Load slash commands for new-session mode (no session id yet)
+  useEffect(() => {
+    if (isNew && newSessionCwd) loadCommands(undefined, newSessionCwd);
+  }, [isNew, newSessionCwd, loadCommands]);
+
   // Compact error auto-dismiss
   useEffect(() => {
     if (!compactError) return;
@@ -823,7 +885,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // State
     data, loading, error, activeLeafId, messages, entryIds, streamState,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
-    retryInfo, contextUsage, systemPrompt, forkingEntryId,
+    retryInfo, contextUsage, systemPrompt, forkingEntryId, slashCommands,
     isCompacting, compactError, compactResult, currentModel, displayModel, sessionStats,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,

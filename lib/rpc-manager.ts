@@ -1,19 +1,25 @@
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { cacheSessionPath } from "./session-reader";
-import type { AgentSessionLike, ToolInfo } from "./pi-types";
+import type { AgentSessionLike, ToolInfo, AgentEvent, ExtensionRunner } from "./pi-types";
 
-// ============================================================================
-// Types
-// ============================================================================
-
-export interface AgentEvent {
-  type: string;
-  [key: string]: unknown;
-}
+// Re-export for backward compatibility
+export type { AgentEvent } from "./pi-types";
 
 type EventListener = (event: AgentEvent) => void;
 
 const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+/**
+ * Safely access the _extensionRunner property from an AgentSession.
+ * This property is private in the SDK but we need it for error bridging.
+ */
+function getExtensionRunner(session: AgentSessionLike): ExtensionRunner | undefined {
+  try {
+    return (session as unknown as { _extensionRunner?: ExtensionRunner })._extensionRunner;
+  } catch {
+    return undefined;
+  }
+}
 
 function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
   if (toolNames.length === 0) return [];
@@ -35,6 +41,7 @@ function withExtensionTools(session: AgentSessionLike, toolNames: string[]): str
 export class AgentSessionWrapper {
   private listeners: EventListener[] = [];
   private unsubscribe: (() => void) | null = null;
+  private unsubExtensionError: (() => void) | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
   private _alive = true;
@@ -58,12 +65,53 @@ export class AgentSessionWrapper {
       this.resetIdleTimer();
       for (const l of this.listeners) l(event);
     });
+    // Bridge extension errors onto the main event bus. pi's ExtensionRunner
+    // emits errors on a SEPARATE listener channel (runner.onError), NOT via
+    // session.subscribe(). Without this bridge, a failing /command silently
+    // does nothing in pi-web — no agent_end ever fires to clear the UI, and the
+    // user has no idea why their slash command did nothing. We re-emit as a
+    // synthetic "extension_error" event so SSE delivers it and the UI can show it.
+    try {
+      const runner = getExtensionRunner(this.inner);
+      if (runner?.onError) {
+        this.unsubExtensionError = runner.onError((err: AgentEvent) => {
+          for (const l of this.listeners) l({ ...err, type: "extension_error" });
+        });
+      }
+    } catch { /* extension runner not present */ }
+    // Stream heartbeats (see events/route.ts) keep the SSE listener alive, but
+    // heartbeats are server-side and do NOT re-enter this wrapper. Compaction /
+    // thinking can run >10 min with no AgentEvent at all, so we also arm a
+    // defensive poll: if the inner session is still streaming when the timer
+    // fires, we reschedule instead of destroying (see resetIdleTimer).
     this.resetIdleTimer();
   }
 
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => this.destroy(), 10 * 60 * 1000);
+    // Idle timeout: destroy the wrapper after 10 minutes of total silence.
+    // CRITICAL: never destroy while the inner session is actively streaming
+    // or compacting. Models with large thinking budgets (xhigh / deepseek-reasoner
+    // / opus extended thinking) can sit silent for >10 minutes between token
+    // chunks; destroying the wrapper mid-run orphans the still-running inner
+    // AgentSession. The next request then reloads a fresh AgentSession from the
+    // same .jsonl file, producing TWO sessions writing the same file → corruption
+    // and the "agent restarted from scratch / lost tool-call history" symptom.
+    // Only the absence of BOTH streaming AND any listener should trigger reaping.
+    this.idleTimer = setTimeout(() => {
+      if (this.inner.isStreaming || this.inner.isCompacting) {
+        this.resetIdleTimer();
+        return;
+      }
+      // If a browser tab is still subscribed to events, keep the session alive
+      // even when idle — otherwise switching tabs for >10 min silently kills the
+      // agent and the next prompt reloads from disk (losing in-flight state).
+      if (this.listeners.length > 0) {
+        this.resetIdleTimer();
+        return;
+      }
+      this.destroy();
+    }, 10 * 60 * 1000);
   }
 
   onEvent(listener: EventListener): () => void {
@@ -221,6 +269,41 @@ export class AgentSessionWrapper {
         return null;
       }
 
+      case "get_commands": {
+        // Surface slash commands for the input autocomplete. Three sources:
+        //   1. Extension commands  (require a bound session → private runner)
+        //   2. Prompt templates   (resourceLoader.getPrompts(), public)
+        //   3. Skills             (resourceLoader.getSkills(), public)
+        // Extension commands live on the ExtensionRunner which is only bound after
+        // AgentSession construction, so they are only available for live sessions.
+        // For brand-new sessions (no wrapper yet) the /api/commands route returns
+        // just templates + skills.
+        const cmds: Array<{ name: string; description: string; source: string }> = [];
+        try {
+          const runner = getExtensionRunner(this.inner);
+          if (runner?.getRegisteredCommands) {
+            for (const c of runner.getRegisteredCommands()) {
+              cmds.push({ name: c.invocationName, description: c.description ?? "", source: "extension" });
+            }
+          }
+        } catch { /* extension runner not bound yet */ }
+        try {
+          const templates = this.inner.promptTemplates;
+          for (const t of templates) {
+            cmds.push({ name: t.name, description: t.description ?? "", source: "prompt" });
+          }
+        } catch { /* ignore */ }
+        try {
+          const skills = this.inner.resourceLoader.getSkills().skills;
+          for (const s of skills) {
+            cmds.push({ name: `skill:${s.name}`, description: s.description ?? "", source: "skill" });
+          }
+        } catch { /* ignore */ }
+        // De-dup by name (extension command + skill can share a name)
+        const seen = new Set<string>();
+        return cmds.filter((c) => (seen.has(c.name) ? false : (seen.add(c.name), true)));
+      }
+
       default:
         throw new Error(`Unsupported command: ${type}`);
     }
@@ -231,6 +314,7 @@ export class AgentSessionWrapper {
     this._alive = false;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.unsubscribe?.();
+    this.unsubExtensionError?.();
     this.onDestroyCallback?.();
   }
 }

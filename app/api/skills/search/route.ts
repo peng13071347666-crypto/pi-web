@@ -112,10 +112,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ results });
     }
   } catch (e: unknown) {
-    const err = e as { stdout?: string; stderr?: string; message?: string };
+    const err = e as { stdout?: string; stderr?: string; message?: string; code?: number | string };
     const raw = (err.stdout ?? "") + (err.stderr ?? "");
     const results = raw ? parseSearchOutput(raw) : [];
     if (results.length > 0) return NextResponse.json({ results });
-    return NextResponse.json({ error: err.message ?? String(e) }, { status: 500 });
+    const msg = (err.message ?? String(e)).trim();
+    // Give a friendlier hint on Windows when npx cannot be spawned.
+    if (msg.includes("ENOENT") && process.platform === "win32") {
+      return NextResponse.json({
+        error: `Unable to run npx. Please ensure Node.js and npm are correctly installed. (${msg})`,
+      }, { status: 500 });
+    }
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

@@ -23,12 +23,15 @@ export interface TextContent {
 
 export interface ImageContent {
   type: "image";
-  source: {
+  source?: {
     type: "base64" | "url";
     media_type?: string;
     data?: string;
     url?: string;
   };
+  // Legacy flat format (pi-ai on-disk)
+  data?: string;
+  mimeType?: string;
 }
 
 export interface ThinkingContent {

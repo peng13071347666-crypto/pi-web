@@ -64,6 +64,8 @@ export function invalidateSessionPathCache(sessionId: string): void {
 
 export function getSessionEntries(filePath: string): SessionEntry[] {
   const entries = SessionManager.open(filePath).getEntries();
+  // Bridge: SDK's SessionEntry type is structurally compatible with our local type
+  // but TypeScript treats them as distinct nominal types
   return entries as unknown as SessionEntry[];
 }
 
@@ -107,8 +109,8 @@ export function buildSessionContext(entries: SessionEntry[], leafId?: string | n
   const byId = new Map<string, SessionEntry>();
   for (const e of entries) byId.set(e.id, e);
 
-  const piEntries = entries as unknown as PiSessionEntry[];
-  const piCtx = piBuildSessionContext(piEntries, leafId, byId as unknown as Map<string, PiSessionEntry>);
+  const piEntries = entries as unknown as PiSessionEntry[]; // SDK type bridge
+  const piCtx = piBuildSessionContext(piEntries, leafId, byId as unknown as Map<string, PiSessionEntry>); // SDK type bridge
 
   // Build entryIds: parallel array to messages[], mapping each message back to its entry id.
   // Needed for fork and navigate_tree calls from the UI.
@@ -164,12 +166,13 @@ export function buildSessionContext(entries: SessionEntry[], leafId?: string | n
   // pi injects compaction summary as {role:"compactionSummary", summary, tokensBefore}.
   // Convert to {role:"user"} so MessageView can render it the same as before.
   const messages = (piCtx.messages as AssistantMessage[]).map((msg) => {
-    const raw = msg as unknown as Record<string, unknown>;
-    if (raw.role === "compactionSummary") {
+    // Check for compaction summary role (not in our type definitions)
+    const rawMsg = msg as unknown as Record<string, unknown>;
+    if (rawMsg.role === "compactionSummary") {
       return {
         role: "user" as const,
-        content: `*The conversation history before this point was compacted into the following summary:*\n\n${raw.summary ?? ""}`,
-        timestamp: raw.timestamp as number | undefined,
+        content: `*The conversation history before this point was compacted into the following summary:*\n\n${rawMsg.summary ?? ""}`,
+        timestamp: rawMsg.timestamp as number | undefined,
       };
     }
     return normalizeToolCalls(msg);

@@ -135,15 +135,13 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
           {imageBlocks.length > 0 && (
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: content ? 8 : 0 }}>
               {imageBlocks.map((img, i) => {
-                // lib/types.ts ImageContent uses {source:{type,data,media_type,url}}
-                // pi-ai on-disk format uses flat {data, mimeType} — handle both
-                const flat = img as unknown as { data?: string; mimeType?: string };
+                // Handle both new {source:{...}} and legacy flat {data, mimeType} formats
                 const src = img.source
                   ? img.source.type === "base64"
                     ? `data:${img.source.media_type};base64,${img.source.data}`
                     : img.source.url ?? ""
-                  : flat.data
-                    ? `data:${flat.mimeType};base64,${flat.data}`
+                  : img.data
+                    ? `data:${img.mimeType};base64,${img.data}`
                     : "";
                 return (
                   // eslint-disable-next-line @next/next/no-img-element
