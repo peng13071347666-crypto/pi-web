@@ -142,6 +142,22 @@ type ModelTestState =
   | { phase: "success"; latencyMs?: number; status?: number; responseText?: string }
   | { phase: "error"; message: string; latencyMs?: number; status?: number };
 
+type FetchedModelState =
+  | { phase: "idle" }
+  | { phase: "fetching" }
+  | { phase: "results"; models: FetchedModel[] }
+  | { phase: "error"; message: string };
+
+interface FetchedModel {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: { input?: number; output?: number };
+}
+
 type Selection =
   | { type: "provider"; name: string }
   | { type: "model"; providerName: string; index: number }
@@ -500,6 +516,197 @@ function setDeepseekCompat(model: ModelEntry, enabled: boolean): ModelEntry {
   return { ...model, compat: Object.keys(rest).length ? rest : undefined };
 }
 
+function FetchModelsPicker({
+  baseUrl,
+  apiKey,
+  headers,
+  onSelect,
+  onClose,
+}: {
+  baseUrl: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+  onSelect: (m: FetchedModel) => void;
+  onClose: () => void;
+}) {
+  const [state, setState] = useState<FetchedModelState>({ phase: "idle" });
+  const [search, setSearch] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 30); }, []);
+
+  const fetchModels = useCallback(async () => {
+    setState({ phase: "fetching" });
+    try {
+      const res = await fetch("/api/models-config/fetch-models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseUrl, apiKey, headers }),
+      });
+      const d = await res.json() as { ok?: boolean; models?: FetchedModel[]; error?: string };
+      if (!res.ok || !d.ok || !d.models) {
+        setState({ phase: "error", message: d.error ?? `HTTP ${res.status}` });
+        return;
+      }
+      setState({ phase: "results", models: d.models });
+    } catch (e) {
+      setState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  }, [baseUrl, apiKey, headers]);
+
+  useEffect(() => { fetchModels(); }, [fetchModels]);
+
+  const filtered = state.phase === "results"
+    ? state.models.filter((m) => {
+        const q = search.toLowerCase();
+        return !q || m.id.toLowerCase().includes(q) || m.name?.toLowerCase().includes(q);
+      })
+    : [];
+
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, zIndex: 1100, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{ width: 680, maxWidth: "calc(100vw - 32px)", maxHeight: "min(70vh, calc(100vh - 32px))", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 10, display: "flex", flexDirection: "column", boxShadow: "0 8px 32px rgba(0,0,0,0.22)", overflow: "hidden" }}>
+        {/* Header */}
+        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>Fetch Models from API</span>
+            {state.phase === "results" && (
+              <span style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 6px", background: "var(--bg-panel)", borderRadius: 4 }}>
+                {state.models.length} models
+              </span>
+            )}
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "2px 6px" }}>×</button>
+        </div>
+
+        {/* Search */}
+        <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6 }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--text-dim)", flexShrink: 0 }}>
+              <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              ref={inputRef}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search models…"
+              style={{ flex: 1, background: "none", border: "none", outline: "none", color: "var(--text)", fontSize: 12, fontFamily: "var(--font-mono)" }}
+            />
+          </div>
+        </div>
+
+        {/* Content */}
+        <div style={{ flex: 1, overflowY: "auto", padding: 8 }}>
+          {state.phase === "fetching" && (
+            <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>
+              Fetching models from API…
+            </div>
+          )}
+          {state.phase === "error" && (
+            <div style={{ padding: 20 }}>
+              <div style={{ padding: "12px 16px", background: "#fee2e2", border: "1px solid #fecaca", borderRadius: 6, color: "#991b1b", fontSize: 12, marginBottom: 12 }}>
+                {state.message}
+              </div>
+              <button
+                onClick={fetchModels}
+                style={{ padding: "6px 14px", background: "var(--accent)", border: "none", borderRadius: 5, color: "#fff", cursor: "pointer", fontSize: 12 }}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {state.phase === "results" && (
+            <>
+              {filtered.length === 0 ? (
+                <div style={{ padding: 40, textAlign: "center", color: "var(--text-dim)", fontSize: 13 }}>
+                  {search ? "No models match" : "No models found"}
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {filtered.slice(0, 200).map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => { onSelect(m); onClose(); }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 10,
+                        padding: "8px 12px",
+                        background: "var(--bg-panel)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        cursor: "pointer",
+                        textAlign: "left",
+                        transition: "border-color 0.12s, background 0.12s",
+                        width: "100%",
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.background = "var(--bg-panel)"; }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--text)", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {m.id}
+                        </div>
+                        {m.name && m.name !== m.id && (
+                          <div style={{ fontSize: 11, color: "var(--text-dim)", marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {m.name}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                        {m.contextWindow && (
+                          <span style={{ fontSize: 10, padding: "2px 5px", background: "rgba(99,102,241,0.1)", color: "rgba(99,102,241,0.8)", borderRadius: 3 }}>
+                            {m.contextWindow >= 1000000 ? `${(m.contextWindow / 1000000).toFixed(0)}M` : m.contextWindow >= 1000 ? `${(m.contextWindow / 1000).toFixed(0)}K` : m.contextWindow} ctx
+                          </span>
+                        )}
+                        {m.maxTokens && (
+                          <span style={{ fontSize: 10, padding: "2px 5px", background: "rgba(16,185,129,0.1)", color: "rgba(16,185,129,0.8)", borderRadius: 3 }}>
+                            {m.maxTokens >= 1000 ? `${(m.maxTokens / 1000).toFixed(0)}K` : m.maxTokens} out
+                          </span>
+                        )}
+                        {m.reasoning && (
+                          <span style={{ fontSize: 10, padding: "2px 5px", background: "rgba(244,114,182,0.1)", color: "rgba(244,114,182,0.8)", borderRadius: 3 }}>
+                            T
+                          </span>
+                        )}
+                        {m.input?.includes("image") && (
+                          <span style={{ fontSize: 10, padding: "2px 5px", background: "rgba(251,146,60,0.1)", color: "rgba(251,146,60,0.8)", borderRadius: 3 }}>
+                            👁
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  ))}
+                  {filtered.length > 200 && (
+                    <div style={{ padding: "8px 0", textAlign: "center", fontSize: 11, color: "var(--text-dim)" }}>
+                      Showing 200 of {filtered.length} models
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center", flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: "var(--text-dim)" }}>
+            {baseUrl}/v1/models
+          </span>
+          <button
+            onClick={fetchModels}
+            disabled={state.phase === "fetching"}
+            style={{ padding: "5px 12px", background: "none", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text-muted)", cursor: state.phase === "fetching" ? "not-allowed" : "pointer", fontSize: 11 }}
+          >
+            {state.phase === "fetching" ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ModelDetail({
   providerName,
   provider,
@@ -514,7 +721,22 @@ function ModelDetail({
   onDelete: () => void;
 }) {
   const [testState, setTestState] = useState<ModelTestState>({ phase: "idle" });
+  const [fetcherOpen, setFetcherOpen] = useState(false);
   const set = <K extends keyof ModelEntry>(k: K, v: ModelEntry[K]) => onChange({ ...model, [k]: v });
+
+  const applyFetchedModel = useCallback((m: FetchedModel) => {
+    const updated: ModelEntry = {
+      ...model,
+      id: m.id,
+      name: m.name ?? model.name,
+      contextWindow: m.contextWindow ?? model.contextWindow,
+      maxTokens: m.maxTokens ?? model.maxTokens,
+      reasoning: m.reasoning ?? model.reasoning,
+      input: m.input ?? model.input,
+      cost: m.cost ? { ...model.cost, ...m.cost } : model.cost,
+    };
+    onChange(updated);
+  }, [model, onChange]);
   const costVal = (k: keyof NonNullable<ModelEntry["cost"]>) => model.cost?.[k] !== undefined ? String(model.cost[k]) : "";
   const setCost = (k: keyof NonNullable<ModelEntry["cost"]>, v: string) => {
     const n = parseFloat(v);
@@ -636,7 +858,36 @@ function ModelDetail({
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        <Field label="ID *"><TextInput value={model.id} onChange={(v) => set("id", v)} placeholder="model-id" mono /></Field>
+        <Field label="ID *">
+          <div style={{ display: "flex", gap: 6 }}>
+            <TextInput value={model.id} onChange={(v) => set("id", v)} placeholder="model-id" mono />
+            <button
+              onClick={() => setFetcherOpen(true)}
+              disabled={!provider.baseUrl}
+              title={provider.baseUrl ? "Fetch model info from API" : "Set base URL first"}
+              style={{
+                height: 30,
+                padding: "0 10px",
+                background: "var(--bg-panel)",
+                border: "1px solid var(--border)",
+                borderRadius: 5,
+                color: provider.baseUrl ? "var(--text-muted)" : "var(--text-dim)",
+                cursor: provider.baseUrl ? "pointer" : "not-allowed",
+                fontSize: 11,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                flexShrink: 0,
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Fetch
+            </button>
+          </div>
+        </Field>
         <Field label="Name"><TextInput value={model.name ?? ""} onChange={(v) => set("name", v || undefined)} placeholder="Display name" /></Field>
       </div>
 
@@ -698,6 +949,16 @@ function ModelDetail({
           ))}
         </div>
       </div>
+
+      {fetcherOpen && provider.baseUrl && (
+        <FetchModelsPicker
+          baseUrl={provider.baseUrl}
+          apiKey={provider.apiKey}
+          headers={provider.headers}
+          onSelect={applyFetchedModel}
+          onClose={() => setFetcherOpen(false)}
+        />
+      )}
     </div>
   );
 }
