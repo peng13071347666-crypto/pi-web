@@ -9,6 +9,7 @@ import { TabBar, type Tab } from "./TabBar";
 import { ModelsConfig } from "./ModelsConfig";
 import { SkillsConfig } from "./SkillsConfig";
 import { AgentsConfig } from "./AgentsConfig";
+import { MultimodalProxyConfig } from "./MultimodalProxyConfig";
 import { BranchNavigator } from "./BranchNavigator";
 import { VersionBanner } from "./VersionBanner";
 import { useTheme } from "@/hooks/useTheme";
@@ -51,6 +52,7 @@ export function AppShell() {
   const [modelsRefreshKey, setModelsRefreshKey] = useState(0);
   const [skillsConfigOpen, setSkillsConfigOpen] = useState(false);
   const [agentsConfigOpen, setAgentsConfigOpen] = useState(false);
+  const [visionConfigOpen, setVisionConfigOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const chatInputRef = useRef<ChatInputHandle | null>(null);
   const topBarRef = useRef<HTMLDivElement>(null);
@@ -332,6 +334,17 @@ export function AppShell() {
                 <circle cx="9" cy="7" r="4" />
                 <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
                 <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+              </svg>
+            ),
+          },
+          {
+            label: "Vision",
+            onClick: () => setVisionConfigOpen(true),
+            disabled: false,
+            icon: (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
               </svg>
             ),
           },
@@ -990,6 +1003,9 @@ export function AppShell() {
     )}
     {agentsConfigOpen && (activeCwd ?? selectedSession?.cwd ?? newSessionCwd) && (
       <AgentsConfig cwd={(activeCwd ?? selectedSession?.cwd ?? newSessionCwd)!} onClose={() => setAgentsConfigOpen(false)} />
+    )}
+    {visionConfigOpen && (
+      <MultimodalProxyConfig sessionId={selectedSession?.id ?? null} onClose={() => setVisionConfigOpen(false)} />
     )}
     </>
   );

@@ -73,7 +73,16 @@ export class AgentSessionWrapper {
     return this._alive;
   }
 
-  start(): void {
+  async start(): Promise<void> {
+    // Emit session_start to extensions (e.g. pi-multimodal-proxy reads config file)
+    // Must happen before any events are processed, otherwise _fileConfig stays empty
+    // and the vision proxy falls back to DEFAULT_CONFIG.
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (this.inner as any).bindExtensions?.({});
+    } catch (err) {
+      console.error("bindExtensions failed:", err);
+    }
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
       this.resetIdleTimer();
       this.emit(event);
@@ -595,7 +604,7 @@ export async function startRpcSession(
     }
 
     const wrapper = new AgentSessionWrapper(inner);
-    wrapper.start();
+    await wrapper.start();
 
     const realSessionId = inner.sessionId as string;
     const realSessionFile = inner.sessionFile as string | undefined;

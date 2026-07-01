@@ -38,10 +38,11 @@ export async function GET(req: Request) {
     const services = await createAgentSessionServices({ cwd, agentDir });
     const registry = services.modelRegistry;
     const available = registry.getAvailable();
-    modelList = available.map((m: { id: string; name: string; provider: string }) => ({
+    modelList = available.map((m: { id: string; name: string; provider: string; input?: string[] }) => ({
       id: m.id,
       name: m.name,
       provider: m.provider,
+      input: m.input ?? [],
     })).sort(compareModelEntries);
     for (const m of available) {
       const key = `${m.provider}:${m.id}`;

@@ -1,0 +1,15 @@
+diff --git a/node_modules/pi-multimodal-proxy/extensions/internal.ts b/node_modules/pi-multimodal-proxy/extensions/internal.ts
+index 50f7eec..e0f27da 100644
+--- a/node_modules/pi-multimodal-proxy/extensions/internal.ts
++++ b/node_modules/pi-multimodal-proxy/extensions/internal.ts
+@@ -494,8 +494,8 @@ export const ASSISTANT_TRUNCATE_CHARS = 500;
+ export const CONTEXT_MAX_CHARS = 3000;
+ export const HASH_HEX_LEN = 32;
+ 
+-export const PROVIDER_PATTERN = /^[a-zA-Z0-9_-]+$/;
+-export const MODEL_ID_PATTERN = /^[a-zA-Z0-9_./:-]+$/;
++export const PROVIDER_PATTERN = /^[\p{L}\p{N}_-]+$/u;
++export const MODEL_ID_PATTERN = /^[\p{L}\p{N}_./:-]+$/u;
+ 
+ export const DEFAULT_VIDEO_SYSTEM_PROMPT = [
+ 	"You are a precise video analysis assistant.",
