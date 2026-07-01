@@ -1,10 +1,18 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect, useReducer } from "react";
-import type { AgentMessage, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type {
+  AgentMessage,
+  ExtensionStatusItem,
+  ExtensionUiRequest,
+  ExtensionWidgetItem,
+  SessionInfo,
+  SessionTreeNode,
+} from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ToolEntry } from "@/components/ToolPanel";
+import type { SessionStatsInfo } from "@/lib/pi-types";
 
 export interface SessionData {
   sessionId: string;
@@ -54,8 +62,44 @@ interface CompactCommandResult {
   estimatedTokensAfter?: number;
 }
 
+interface LastAssistantTextResponse {
+  text?: string;
+}
+
+type AgentStateResponse = {
+  contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
+  systemPrompt?: string;
+  thinkingLevel?: string;
+  isStreaming?: boolean;
+  isPromptRunning?: boolean;
+  isCompacting?: boolean;
+  extensionStatuses?: ExtensionStatusItem[];
+  extensionWidgets?: ExtensionWidgetItem[];
+};
+
+type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
+export type NoticeType = "info" | "success" | "warning" | "error";
+
+export type NoticeItem = {
+  id: string;
+  message: string;
+  type: NoticeType;
+  exiting?: boolean;
+};
+
+type NoticeState = {
+  visible: NoticeItem[];
+  pending: NoticeItem[];
+};
+
+type NoticeAction =
+  | { type: "add"; notice: NoticeItem }
+  | { type: "mark_oldest_exiting" }
+  | { type: "remove"; id: string };
+
 export type AgentPhase =
   | { kind: "waiting_model" }
+  | { kind: "running_command" }
   | { kind: "running_tools"; tools: { id: string; name: string }[] }
   | null;
 
@@ -64,6 +108,23 @@ export interface CompactResultInfo {
   tokensBefore: number;
   estimatedTokensAfter: number;
 }
+
+export interface SlashCommandInfo {
+  name: string;
+  description?: string;
+  source: "extension" | "prompt" | "skill";
+  sourceInfo?: {
+    path: string;
+    source: string;
+    scope: "user" | "project" | "temporary";
+    origin: "package" | "top-level";
+    baseDir?: string;
+  };
+}
+
+export type BuiltinSlashCommandResult =
+  | { handled: false }
+  | { handled: true; message?: string; error?: string; action?: "openSessionStats" };
 
 export interface UseAgentSessionOptions {
   session: SessionInfo | null;
@@ -75,6 +136,7 @@ export interface UseAgentSessionOptions {
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
   onSystemPromptChange?: (prompt: string | null) => void;
+  onSessionStatsPanelOpen?: () => void;
   setToolPreset?: (preset: "none" | "default" | "full") => void;
 }
 
@@ -82,7 +144,70 @@ export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" 
 
 const PROGRAMMATIC_SCROLL_IGNORE_MS = 700;
 const USER_SCROLL_INTENT_MS = 1200;
+const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
+const PROMPT_SETTLE_POLL_MS = 600;
+const PROMPT_SETTLE_MAX_MS = 20_000;
+const MAX_NOTICES = 5;
+const NOTICE_VISIBLE_MS = 5000;
+const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
+
+function createNoticeId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function markOldestNoticeExiting(notices: NoticeItem[]): NoticeItem[] {
+  const index = notices.findIndex((notice) => !notice.exiting);
+  if (index === -1) return notices;
+  return notices.map((notice, i) => (
+    i === index ? { ...notice, exiting: true } : notice
+  ));
+}
+
+function fillPendingNotices(visible: NoticeItem[], pending: NoticeItem[]): NoticeState {
+  let nextVisible = visible;
+  let nextPending = pending;
+  while (nextPending.length > 0 && nextVisible.length < MAX_NOTICES) {
+    const [next, ...rest] = nextPending;
+    nextVisible = [...nextVisible, next];
+    nextPending = rest;
+  }
+  if (nextPending.length > 0 && !nextVisible.some((notice) => notice.exiting)) {
+    nextVisible = markOldestNoticeExiting(nextVisible);
+  }
+  return { visible: nextVisible, pending: nextPending };
+}
+
+function noticeReducer(state: NoticeState, action: NoticeAction): NoticeState {
+  switch (action.type) {
+    case "add": {
+      if (state.visible.some((notice) => notice.exiting) || state.visible.length >= MAX_NOTICES) {
+        return {
+          visible: state.visible.some((notice) => notice.exiting)
+            ? state.visible
+            : markOldestNoticeExiting(state.visible),
+          pending: [...state.pending, action.notice],
+        };
+      }
+      return { ...state, visible: [...state.visible, action.notice] };
+    }
+    case "mark_oldest_exiting":
+      return { ...state, visible: markOldestNoticeExiting(state.visible) };
+    case "remove": {
+      const visible = state.visible.filter((notice) => notice.id !== action.id);
+      return fillPendingNotices(visible, state.pending);
+    }
+    default:
+      return state;
+  }
+}
 
 function readCompactResult(result: unknown, reason: string): CompactResultInfo | null {
   if (!result || typeof result !== "object") return null;
@@ -103,14 +228,6 @@ export interface AttachedImage {
   previewUrl: string;
 }
 
-export interface AttachedFile {
-  name: string;
-  size: number;
-  type: string;
-  data?: string;
-  isText?: boolean;
-}
-
 type SelectedModel = { provider: string; modelId: string };
 type ModelEntry = { id: string; name: string; provider: string };
 type ModelsResponse = {
@@ -121,10 +238,14 @@ type ModelsResponse = {
   thinkingLevelMaps?: Record<string, Record<string, string | null>>;
 };
 
+type SlashCommandsResponse = {
+  commands?: SlashCommandInfo[];
+};
+
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
     session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked,
-    modelsRefreshKey, onBranchDataChange, onSystemPromptChange,
+    modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSessionStatsPanelOpen,
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
@@ -149,13 +270,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [forkingEntryId, setForkingEntryId] = useState<string | null>(null);
-  const [slashCommands, setSlashCommands] = useState<{ name: string; description: string; source: string }[]>([]);
   const [currentModelOverride, setCurrentModelOverride] = useState<{ provider: string; modelId: string } | null>(null);
   const [pendingModel, setPendingModel] = useState<{ provider: string; modelId: string } | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactError, setCompactError] = useState<string | null>(null);
   const [compactResult, setCompactResult] = useState<CompactResultInfo | null>(null);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>(null);
+  const [slashCommands, setSlashCommands] = useState<SlashCommandInfo[]>([]);
+  const [slashCommandsLoading, setSlashCommandsLoading] = useState(false);
+  const [noticeState, dispatchNotice] = useReducer(noticeReducer, { visible: [], pending: [] });
+  const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
+  const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
+  const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
+  const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
@@ -169,6 +296,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const ignoreProgrammaticScrollUntilRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
+  const newSessionPromotedRef = useRef(false);
+  const promptRunIdRef = useRef(0);
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -176,11 +306,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const displayModel = isNew ? (newSessionModel ?? newSessionDefaultModel) : currentModel;
 
   const sessionStats = (() => {
-    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    if (sessionStatsOverride) return sessionStatsOverride;
+    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
     let cost = 0;
+    let userMessages = 0;
+    let assistantMessages = 0;
+    let toolResults = 0;
+    let toolCalls = 0;
     for (const msg of messages) {
+      if (msg.role === "user") userMessages += 1;
+      if (msg.role === "toolResult") toolResults += 1;
       if (msg.role !== "assistant") continue;
+      assistantMessages += 1;
       const u = (msg as import("@/lib/types").AssistantMessage).usage;
+      toolCalls += (msg as import("@/lib/types").AssistantMessage).content.filter((c) => c.type === "toolCall").length;
       if (!u) continue;
       tokens.input += u.input ?? 0;
       tokens.output += u.output ?? 0;
@@ -188,8 +327,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       tokens.cacheWrite += u.cacheWrite ?? 0;
       cost += u.cost?.total ?? 0;
     }
-    const total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-    return total > 0 ? { tokens, cost } : null;
+    tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+    if (tokens.total === 0 && messages.length === 0) return null;
+    return {
+      sessionFile: data?.filePath || undefined,
+      sessionId: sessionIdRef.current ?? session?.id ?? "",
+      sessionName: session?.name,
+      userMessages,
+      assistantMessages,
+      toolCalls,
+      toolResults,
+      totalMessages: messages.length,
+      tokens,
+      cost,
+      ...(contextUsage ? { contextUsage } : {}),
+    } satisfies SessionStatsInfo;
   })();
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
@@ -209,13 +361,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData & { agentState?: { running: boolean; state?: { isStreaming?: boolean; isCompacting?: boolean; contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null; systemPrompt?: string; thinkingLevel?: string } } };
+      const d = await res.json() as SessionData & { agentState?: { running: boolean; state?: AgentStateResponse } };
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
       setCurrentModelOverride(null);
       setError(null);
+      if (d.agentState?.state?.extensionStatuses) setExtensionStatuses(d.agentState.state.extensionStatuses);
+      if (d.agentState?.state?.extensionWidgets) setExtensionWidgets(d.agentState.state.extensionWidgets);
       // If no live agent state, fall back to thinking level from session file
       if (!d.agentState?.state?.thinkingLevel && d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
         setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
@@ -256,65 +410,230 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [setToolPresetState]);
 
-  // Slash commands for the ChatInput autocomplete. Two sources merged:
-  //   - /api/commands?cwd=...  (prompt templates + skills, no session needed)
-  //   - get_commands via RPC    (adds extension commands when a session is live)
-  // We fetch the static list on cwd change and augment with session commands
-  // whenever the session id changes.
-  const loadCommands = useCallback(async (sid?: string, cwd?: string) => {
-    const staticList: { name: string; description: string; source: string }[] = [];
-    if (cwd) {
-      try {
-        const res = await fetch(`/api/commands?cwd=${encodeURIComponent(cwd)}`);
-        if (res.ok) {
-          const data = (await res.json()) as { commands?: { name: string; description: string; source: string }[] };
-          if (data.commands) staticList.push(...data.commands);
-        }
-      } catch { /* ignore */ }
-    }
-    if (sid) {
-      try {
-        const sessionCmds = await sendAgentCommand<{ name: string; description: string; source: string }[]>(sid, { type: "get_commands" });
-        if (Array.isArray(sessionCmds)) {
-          // Merge: session list includes extension commands + templates + skills.
-          // Prefer the session list when available (it has extension commands).
-          const seen = new Set<string>();
-          const merged = [...sessionCmds, ...staticList].filter((c) =>
-            seen.has(c.name) ? false : (seen.add(c.name), true),
-          );
-          setSlashCommands(merged);
-          return;
-        }
-      } catch { /* session not running yet — fall back to static list */ }
-    }
-    setSlashCommands(staticList);
-  }, []);
+  const promoteNewSession = useCallback((messageCount = 0, firstMessage = "(no messages)") => {
+    const sid = sessionIdRef.current;
+    if (!isNew || !newSessionCwd || !sid || newSessionPromotedRef.current) return;
+    newSessionPromotedRef.current = true;
+    onSessionCreated?.({
+      id: sid,
+      path: "",
+      cwd: newSessionCwd,
+      name: undefined,
+      created: new Date().toISOString(),
+      modified: new Date().toISOString(),
+      messageCount,
+      firstMessage,
+    });
+  }, [isNew, newSessionCwd, onSessionCreated]);
 
-  const connectEvents = useCallback((sid: string) => {
+  const ensureNewSession = useCallback(async () => {
+    if (sessionIdRef.current) return sessionIdRef.current;
+    if (!isNew || !newSessionCwd) return sessionIdRef.current;
+    if (ensuringNewSessionRef.current) return ensuringNewSessionRef.current;
+
+    const promise = (async () => {
+      const selectedModel = newSessionModel ?? newSessionDefaultModel;
+      if (selectedModel) setPendingModel(selectedModel);
+      const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
+      const toolNames = toolPreset === "none" ? PRESET_NONE : toolPreset === "default" ? PRESET_DEFAULT : PRESET_FULL;
+      const res = await fetch("/api/agent/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cwd: newSessionCwd,
+          type: "ensure_session",
+          toolNames,
+          ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
+          ...(thinkingLevel !== "auto" ? { thinkingLevel } : {}),
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const result = await res.json() as { sessionId: string };
+      const realId = result.sessionId;
+      sessionIdRef.current = realId;
+      return realId;
+    })();
+
+    ensuringNewSessionRef.current = promise;
+    try {
+      return await promise;
+    } finally {
+      ensuringNewSessionRef.current = null;
+    }
+  }, [isNew, newSessionCwd, newSessionModel, newSessionDefaultModel, toolPreset, thinkingLevel]);
+
+  const loadSlashCommands = useCallback(async () => {
+    const sid = sessionIdRef.current ?? await ensureNewSession();
+    if (!sid) {
+      setSlashCommands([]);
+      return [] as SlashCommandInfo[];
+    }
+    setSlashCommandsLoading(true);
+    try {
+      const data = await sendAgentCommand<SlashCommandsResponse>(sid, { type: "get_commands" });
+      const commands = data?.commands ?? [];
+      setSlashCommands(commands);
+      return commands;
+    } catch (e) {
+      console.error("Failed to load slash commands:", e);
+      setSlashCommands([]);
+      return [] as SlashCommandInfo[];
+    } finally {
+      setSlashCommandsLoading(false);
+    }
+  }, [ensureNewSession]);
+
+  const connectEvents = useCallback((sid: string): Promise<void> => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
     const es = new EventSource(`/api/agent/${encodeURIComponent(sid)}/events`);
     eventSourceRef.current = es;
-    es.onmessage = (e) => {
-      try {
-        const event = JSON.parse(e.data) as AgentEvent;
-        handleAgentEventRef.current?.(event);
-      } catch {
-        // ignore
-      }
-    };
-    es.onerror = () => {
-      if (eventSourceRef.current === es && agentRunningRef.current) {
-        es.close();
-        eventSourceRef.current = null;
-        setTimeout(() => {
-          if (agentRunningRef.current) connectEvents(sid);
-        }, 1000);
-      }
-    };
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      const timeout = setTimeout(settle, 1500);
+
+      es.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data) as AgentEvent;
+          if (event.type === "connected") settle();
+          handleAgentEventRef.current?.(event);
+        } catch {
+          // ignore
+        }
+      };
+      es.onerror = () => {
+        settle();
+        if (eventSourceRef.current === es && agentRunningRef.current) {
+          es.close();
+          eventSourceRef.current = null;
+          setTimeout(() => {
+            if (agentRunningRef.current) void connectEvents(sid);
+          }, 1000);
+        }
+      };
+    });
   }, []);
+
+  const respondToExtensionUi = useCallback(async (
+    request: ExtensionUiDialogRequest,
+    response: { value: string } | { confirmed: boolean } | { cancelled: true },
+  ) => {
+    const sid = sessionIdRef.current;
+    setExtensionDialog((current) => current?.id === request.id ? null : current);
+    if (!sid) return;
+    try {
+      await sendAgentCommand(sid, {
+        type: "extension_ui_response",
+        id: request.id,
+        ...response,
+      });
+    } catch (e) {
+      console.error("Failed to send extension UI response:", e);
+    }
+  }, []);
+
+  const addNotice = useCallback((notice: { id?: string; message: string; type?: NoticeType }) => {
+    const message = notice.message.trim();
+    if (!message) return;
+    dispatchNotice({
+      type: "add",
+      notice: {
+        id: notice.id ?? createNoticeId(),
+        message,
+        type: notice.type ?? "info",
+      },
+    });
+  }, []);
+
+  const handleExtensionUiRequest = useCallback((request: ExtensionUiRequest) => {
+    switch (request.method) {
+      case "select":
+      case "confirm":
+      case "input":
+      case "editor":
+        setExtensionDialog(request);
+        break;
+      case "notify": {
+        addNotice({
+          id: request.id,
+          message: request.message,
+          type: request.notifyType ?? "info",
+        });
+        break;
+      }
+      case "setStatus":
+        setExtensionStatuses((prev) => {
+          const rest = prev.filter((item) => item.key !== request.statusKey);
+          return request.statusText ? [...rest, { key: request.statusKey, text: request.statusText }] : rest;
+        });
+        break;
+      case "setWidget":
+        setExtensionWidgets((prev) => {
+          const rest = prev.filter((item) => item.key !== request.widgetKey);
+          return request.widgetLines
+            ? [...rest, {
+                key: request.widgetKey,
+                lines: request.widgetLines,
+                placement: request.widgetPlacement ?? "aboveEditor",
+              }]
+            : rest;
+        });
+        break;
+      case "setTitle":
+        if (request.title) document.title = request.title;
+        break;
+      case "set_editor_text":
+        opts.chatInputRef?.current?.insertText(request.text);
+        break;
+    }
+  }, [addNotice, opts.chatInputRef]);
+
+  const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId?: number) => {
+    try {
+      if (sid) await loadSession(sid);
+    } finally {
+      if (runId !== undefined && promptRunIdRef.current !== runId) return;
+      if (!agentRunningRef.current) return;
+      agentRunningRef.current = false;
+      setAgentRunning(false);
+      setAgentPhase(null);
+      setRetryInfo(null);
+      dispatch({ type: "end" });
+      onAgentEnd?.();
+    }
+  }, [loadSession, onAgentEnd]);
+
+  const waitForPromptSettlement = useCallback(async (sid: string, runId?: number) => {
+    await delay(PROMPT_SETTLE_INITIAL_DELAY_MS);
+    const startedAt = Date.now();
+
+    while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
+      if (runId !== undefined && promptRunIdRef.current !== runId) return;
+      try {
+        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        if (res.ok) {
+          const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+          const state = data.state;
+          if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
+            await finishPromptWithoutStream(sid, runId);
+            return;
+          }
+        }
+      } catch {
+        // SSE remains the primary completion path.
+      }
+      await delay(PROMPT_SETTLE_POLL_MS);
+    }
+  }, [finishPromptWithoutStream]);
 
   useEffect(() => {
     agentRunningRef.current = agentRunning;
@@ -338,13 +657,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           loadSession(sessionIdRef.current);
           fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
             .then((r) => r.json())
-            .then((d: { state?: { contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null; systemPrompt?: string } }) => {
+            .then((d: { state?: AgentStateResponse }) => {
               if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
+              if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
+              if (d.state?.extensionWidgets !== undefined) setExtensionWidgets(d.state.extensionWidgets ?? []);
             })
             .catch(() => {});
         }
         onAgentEnd?.();
+        break;
+      case "prompt_done":
+        if (!agentRunningRef.current) break;
+        void finishPromptWithoutStream(sessionIdRef.current);
+        break;
+      case "prompt_error":
+        addNotice({ type: "error", message: (event.errorMessage as string | undefined) ?? "Command failed" });
         break;
       case "message_start":
       case "message_update": {
@@ -393,24 +721,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "auto_retry_end":
         setRetryInfo(null);
         break;
-      case "extension_error": {
-        // Extension command / skill expansion failures surface here. Without
-        // this, typing a bad /command silently does nothing (the command handler
-        // catches the error and emits this event, but the agent loop never runs,
-        // so there's no agent_end to clear the "running" state). We surface the
-        // error as a compact tool-style message so the user sees what went wrong.
-        const errMsg = (event.error as string | undefined) ?? "Extension error";
-        const extPath = (event.extensionPath as string | undefined) ?? "extension";
-        console.error(`[extension_error] ${extPath}:`, errMsg);
-        setMessages((prev) => [...prev, {
-          role: "toolResult",
-          toolCallId: `ext-${Date.now()}`,
-          content: [{ type: "text", text: `Extension error (${extPath}): ${errMsg}` }],
-          isError: true,
-          timestamp: Date.now(),
-        } as import("@/lib/types").AgentMessage]);
-        break;
-      }
       case "auto_compaction_start":
       case "compaction_start":
         setIsCompacting(true);
@@ -428,54 +738,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (sessionIdRef.current) loadSession(sessionIdRef.current);
         }
         break;
+      case "extension_ui_request":
+        handleExtensionUiRequest(event as ExtensionUiRequest);
+        break;
     }
-  }, [loadSession, onAgentEnd]);
+  }, [addNotice, finishPromptWithoutStream, handleExtensionUiRequest, loadSession, onAgentEnd]);
   handleAgentEventRef.current = handleAgentEvent;
 
-  const handleSend = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
-    if (!message.trim() && !images?.length && !files?.length) return;
+  const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage && !images?.length) return;
     if (agentRunning) return;
+    const isSlashCommandPrompt = !images?.length && trimmedMessage.startsWith("/");
+    const promptRunId = promptRunIdRef.current + 1;
 
     const imageBlocks = images?.map((img) => ({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } }));
-    
-    // Process file attachments into content blocks
-    const fileContent: string[] = [];
-    if (files?.length) {
-      for (const file of files) {
-        if (file.isText && file.data) {
-          // Text files: include content as a code block
-          const ext = file.name.split('.').pop()?.toLowerCase() || '';
-          const langMap: Record<string, string> = {
-            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
-            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
-            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
-            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
-            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
-            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
-          };
-          const lang = langMap[ext] || '';
-          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
-        } else {
-          // Binary files: just mention the file
-          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
-        }
-      }
-    }
-    
-    // Combine message with file content
-    const fullMessage = message.trim() + fileContent.join('');
-    
     const userMsg: AgentMessage = {
       role: "user",
       content: imageBlocks?.length
-        ? [...(fullMessage.trim() ? [{ type: "text" as const, text: fullMessage }] : []), ...imageBlocks]
-        : fullMessage,
+        ? [...(message.trim() ? [{ type: "text" as const, text: message }] : []), ...imageBlocks]
+        : message,
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, userMsg]);
+    promptRunIdRef.current = promptRunId;
     agentRunningRef.current = true;
     setAgentRunning(true);
-    setAgentPhase({ kind: "waiting_model" });
+    setAgentPhase(isSlashCommandPrompt ? { kind: "running_command" } : { kind: "waiting_model" });
     dispatch({ type: "start" });
     pendingScrollToUserRef.current = true;
     completionScrollAllowedRef.current = true;
@@ -483,48 +772,63 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
 
     try {
+      let sentSessionId: string | null = null;
       if (isNew && newSessionCwd) {
         const selectedModel = newSessionModel;
-        if (selectedModel) setPendingModel(selectedModel);
-        const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
-        const toolNames = toolPreset === "none" ? PRESET_NONE : toolPreset === "default" ? PRESET_DEFAULT : PRESET_FULL;
-        const res = await fetch("/api/agent/new", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            cwd: newSessionCwd,
+        const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+
+        if (existingSid) {
+          sentSessionId = existingSid;
+          if (selectedModel) {
+            setPendingModel(selectedModel);
+            await sendAgentCommand(existingSid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
+          }
+          await connectEvents(existingSid);
+          await sendAgentCommand(existingSid, {
             type: "prompt",
-            message: fullMessage,
-            toolNames,
+            message,
             ...(piImages?.length ? { images: piImages } : {}),
-            ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
-            ...(thinkingLevel !== "auto" ? { thinkingLevel } : {}),
-          }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const result = await res.json() as { sessionId: string };
-        const realId = result.sessionId;
-        sessionIdRef.current = realId;
-        connectEvents(realId);
-        onSessionCreated?.({
-          id: realId,
-          path: "",
-          cwd: newSessionCwd,
-          name: undefined,
-          created: new Date().toISOString(),
-          modified: new Date().toISOString(),
-          messageCount: 1,
-          firstMessage: message,
-        });
-        // Session now exists — fetch the full command list (incl. extension commands)
-        loadCommands(realId, newSessionCwd);
+          });
+          promoteNewSession(1, message);
+        } else {
+          if (selectedModel) setPendingModel(selectedModel);
+          const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
+          const toolNames = toolPreset === "none" ? PRESET_NONE : toolPreset === "default" ? PRESET_DEFAULT : PRESET_FULL;
+          const res = await fetch("/api/agent/new", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              cwd: newSessionCwd,
+              type: "ensure_session",
+              toolNames,
+              ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
+              ...(thinkingLevel !== "auto" ? { thinkingLevel } : {}),
+            }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const result = await res.json() as { sessionId: string };
+          const realId = result.sessionId;
+          sessionIdRef.current = realId;
+          sentSessionId = realId;
+          await connectEvents(realId);
+          await sendAgentCommand(realId, {
+            type: "prompt",
+            message,
+            ...(piImages?.length ? { images: piImages } : {}),
+          });
+          promoteNewSession(1, message);
+        }
       } else if (session) {
-        connectEvents(session.id);
+        sentSessionId = session.id;
+        await connectEvents(session.id);
         await sendAgentCommand(session.id, {
           type: "prompt",
-          message: fullMessage,
+          message,
           ...(piImages?.length ? { images: piImages } : {}),
         });
+      }
+      if (isSlashCommandPrompt && sentSessionId) {
+        void waitForPromptSettlement(sentSessionId, promptRunId);
       }
     } catch (e) {
       console.error("Failed to send message:", e);
@@ -533,7 +837,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, onSessionCreated]);
+  }, [isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -586,6 +890,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
     if (isNew) {
       setNewSessionModel({ provider, modelId });
+      setPendingModel({ provider, modelId });
+      const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+      if (!sid) return;
+      try {
+        await sendAgentCommand(sid, { type: "set_model", provider, modelId });
+      } catch (e) {
+        console.error("Failed to set model:", e);
+      }
       return;
     }
     const sid = sessionIdRef.current;
@@ -616,39 +928,86 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [isCompacting, loadSession]);
 
-  const handleSteer = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
+  const handleBuiltinSlashCommand = useCallback(async (text: string): Promise<BuiltinSlashCommandResult> => {
+    if (!text.startsWith("/")) return { handled: false };
+    const match = text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+    if (!match) return { handled: false };
+
+    const [, commandName, rawArgs = ""] = match;
+    const args = rawArgs.trim();
+    const sid = sessionIdRef.current ?? await ensureNewSession();
+    const complete = (result: BuiltinSlashCommandResult): BuiltinSlashCommandResult => {
+      if (!result.handled) return result;
+      if (result.error) {
+        addNotice({ type: "error", message: result.error });
+      } else if (result.action !== "openSessionStats") {
+        addNotice({ type: "success", message: result.message ?? "Command completed" });
+      }
+      return result;
+    };
+
+    try {
+      switch (commandName) {
+        case "compact": {
+          if (!sid || isCompacting) return complete({ handled: true, error: "No active session to compact" });
+          setIsCompacting(true);
+          setCompactError(null);
+          setCompactResult(null);
+          const result = await sendAgentCommand<CompactCommandResult>(sid, {
+            type: "compact",
+            ...(args ? { customInstructions: args } : {}),
+          });
+          setCompactResult(readCompactResult(result, "manual"));
+          if (await loadSession(sid, true)) promoteNewSession();
+          return complete({ handled: true, message: "Compacted context" });
+        }
+
+        case "name": {
+          if (!sid) return complete({ handled: true, error: "No active session to name" });
+          if (!args) return complete({ handled: true, error: "Usage: /name <name>" });
+          await sendAgentCommand(sid, { type: "set_session_name", name: args });
+          if (await loadSession(sid)) promoteNewSession();
+          return complete({ handled: true, message: `Session renamed to ${args}` });
+        }
+
+        case "session": {
+          if (!sid) return complete({ handled: true, error: "No active session" });
+          const stats = await sendAgentCommand<SessionStatsInfo>(sid, { type: "get_session_stats" });
+          if (stats) {
+            setSessionStatsOverride(stats);
+          }
+          onSessionStatsPanelOpen?.();
+          return complete({ handled: true, action: "openSessionStats" });
+        }
+
+        case "copy": {
+          if (!sid) return complete({ handled: true, error: "No active session" });
+          const data = await sendAgentCommand<LastAssistantTextResponse>(sid, { type: "get_last_assistant_text" });
+          const textToCopy = data?.text ?? "";
+          if (!textToCopy) return complete({ handled: true, error: "No assistant message to copy" });
+          await navigator.clipboard.writeText(textToCopy);
+          return complete({ handled: true, message: "Copied last assistant message" });
+        }
+
+        default:
+          return { handled: false };
+      }
+    } catch (e) {
+      return complete({ handled: true, error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      if (commandName === "compact") setIsCompacting(false);
+    }
+  }, [addNotice, ensureNewSession, isCompacting, loadSession, promoteNewSession, onSessionStatsPanelOpen]);
+
+  const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    
-    // Process file attachments
-    const fileContent: string[] = [];
-    if (files?.length) {
-      for (const file of files) {
-        if (file.isText && file.data) {
-          const ext = file.name.split('.').pop()?.toLowerCase() || '';
-          const langMap: Record<string, string> = {
-            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
-            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
-            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
-            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
-            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
-            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
-          };
-          const lang = langMap[ext] || '';
-          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
-        } else {
-          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
-        }
-      }
-    }
-    
-    const fullMessage = `[steer] ${message}${fileContent.join('')}`;
-    setMessages((prev) => [...prev, { role: "user", content: fullMessage, timestamp: Date.now() } as AgentMessage]);
+    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${message}`, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "steer",
-        message: fullMessage,
+        message,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
@@ -656,39 +1015,40 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFile[]) => {
+  const handlePromptWithStreamingBehavior = useCallback(async (
+    message: string,
+    behavior: "steer" | "followUp",
+    images?: AttachedImage[],
+  ) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    
-    // Process file attachments
-    const fileContent: string[] = [];
-    if (files?.length) {
-      for (const file of files) {
-        if (file.isText && file.data) {
-          const ext = file.name.split('.').pop()?.toLowerCase() || '';
-          const langMap: Record<string, string> = {
-            'js': 'javascript', 'jsx': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
-            'py': 'python', 'rb': 'ruby', 'java': 'java', 'go': 'go', 'rs': 'rust',
-            'c': 'c', 'cpp': 'cpp', 'cs': 'csharp', 'php': 'php', 'swift': 'swift',
-            'html': 'html', 'css': 'css', 'scss': 'scss', 'json': 'json', 'xml': 'xml',
-            'yaml': 'yaml', 'yml': 'yaml', 'toml': 'toml', 'md': 'markdown',
-            'sh': 'bash', 'bash': 'bash', 'sql': 'sql', 'r': 'r', 'lua': 'lua',
-          };
-          const lang = langMap[ext] || '';
-          fileContent.push(`\n\n**[File: ${file.name}]**\n\n\`\`\`${lang}\n${file.data}\n\`\`\``);
-        } else {
-          fileContent.push(`\n\n**[Attached: ${file.name} (${file.size > 1024 ? Math.round(file.size / 1024) + 'KB' : file.size + 'B'})]**`);
-        }
-      }
+    setMessages((prev) => [...prev, {
+      role: "user",
+      content: behavior === "steer" ? `[steer] ${message}` : message,
+      timestamp: Date.now(),
+    } as AgentMessage]);
+    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    try {
+      await sendAgentCommand(sid, {
+        type: "prompt",
+        message,
+        streamingBehavior: behavior,
+        ...(piImages?.length ? { images: piImages } : {}),
+      });
+    } catch (e) {
+      console.error("Failed to queue prompt:", e);
     }
-    
-    const fullMessage = `${message}${fileContent.join('')}`;
-    setMessages((prev) => [...prev, { role: "user", content: fullMessage, timestamp: Date.now() } as AgentMessage]);
+  }, []);
+
+  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    setMessages((prev) => [...prev, { role: "user", content: message, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "follow_up",
-        message: fullMessage,
+        message,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
@@ -709,7 +1069,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
     setThinkingLevel(level);
     if (level === "auto") return; // "auto" leaves pi's current setting untouched
-    const sid = sessionIdRef.current;
+    const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
       await sendAgentCommand(sid, { type: "set_thinking_level", level });
@@ -722,7 +1082,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
     const toolNames = preset === "none" ? PRESET_NONE : preset === "default" ? PRESET_DEFAULT : PRESET_FULL;
     setToolPresetState(preset);
-    const sid = sessionIdRef.current;
+    const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
       await sendAgentCommand(sid, { type: "set_tools", toolNames });
@@ -767,19 +1127,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       loadSession(session.id, true, true).then((agentState) => {
         if (agentState?.running) {
           loadTools(session.id);
-          if (agentState.state?.isStreaming) {
+          if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
+            agentRunningRef.current = true;
             setAgentRunning(true);
-            setAgentPhase({ kind: "waiting_model" });
-            connectEvents(session.id);
+            setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
+            dispatch({ type: "start" });
+            void connectEvents(session.id);
+            if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {
+              void waitForPromptSettlement(session.id);
+            }
           }
         }
-        // Load slash commands (session-bound list includes extension commands)
-        loadCommands(session.id, session.cwd);
         if (agentState?.state) {
           if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
           if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
           if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
           if (agentState.state.thinkingLevel !== undefined) setThinkingLevel((agentState.state.thinkingLevel as ThinkingLevelOption) ?? "auto");
+          if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
+          if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
         }
       });
     }
@@ -863,11 +1228,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => controller.abort();
   }, [isNew, modelsRefreshKey, newSessionCwd, session?.cwd]);
 
-  // Load slash commands for new-session mode (no session id yet)
-  useEffect(() => {
-    if (isNew && newSessionCwd) loadCommands(undefined, newSessionCwd);
-  }, [isNew, newSessionCwd, loadCommands]);
-
   // Compact error auto-dismiss
   useEffect(() => {
     if (!compactError) return;
@@ -881,12 +1241,35 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => clearTimeout(t);
   }, [compactResult]);
 
+  useEffect(() => {
+    if (noticeState.visible.length === 0) return;
+    const exiting = noticeState.visible.find((notice) => notice.exiting);
+    if (exiting) {
+      const t = setTimeout(() => {
+        dispatchNotice({ type: "remove", id: exiting.id });
+      }, NOTICE_EXIT_ANIMATION_MS);
+      return () => clearTimeout(t);
+    }
+    const oldest = noticeState.visible[0];
+    if (!oldest) return;
+    const t = setTimeout(() => {
+      dispatchNotice({ type: "mark_oldest_exiting" });
+    }, NOTICE_VISIBLE_MS);
+    return () => clearTimeout(t);
+  }, [noticeState.visible]);
+
+  useEffect(() => {
+    setSessionStatsOverride(null);
+  }, [messages.length, contextUsage?.tokens, contextUsage?.percent, contextUsage?.contextWindow]);
+
   return {
     // State
     data, loading, error, activeLeafId, messages, entryIds, streamState,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
-    retryInfo, contextUsage, systemPrompt, forkingEntryId, slashCommands,
+    retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, sessionStats,
+    slashCommands, slashCommandsLoading,
+    notices: noticeState.visible, extensionDialog, extensionStatuses, extensionWidgets, respondToExtensionUi,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,
     isNew,
@@ -895,8 +1278,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,
     // Actions
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
-    handleCompact, handleSteer, handleFollowUp, handleAbortCompaction,
-    handleToolPresetChange, handleThinkingLevelChange, loadTools, setActiveLeafId, setData, setMessages,
+    handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
+    handleBuiltinSlashCommand,
+    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
     // Subscriptions
     handleAgentEventRef,

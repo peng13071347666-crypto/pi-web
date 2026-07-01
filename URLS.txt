@@ -1,0 +1,17 @@
+pi-web Multi-Instance URLs
+==========================
+
+Daily use:
+http://localhost:30142
+
+Parallel tasks:
+http://localhost:30142
+http://localhost:30143
+http://localhost:30144
+http://localhost:30145
+http://localhost:30146
+
+How to use:
+1. Double-click start-30142.bat for daily use
+2. Double-click other .bat files for parallel tasks
+3. Close command window to stop instance
