@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { AgentMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { AgentMessage, ArtifactItem, ExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
@@ -23,6 +23,8 @@ interface Props {
   onSessionStatsChange?: (stats: SessionStatsInfo | null) => void;
   onSessionStatsPanelOpen?: () => void;
   onContextUsageChange?: (usage: { percent: number | null; contextWindow: number; tokens: number | null } | null) => void;
+  onArtifactsChange?: (artifacts: ArtifactItem[]) => void;
+  onArtifactOpenRequest?: (filePath: string) => void;
 }
 
 function phaseLabel(phase: AgentPhase): string {
@@ -97,7 +99,7 @@ function Typewriter({ phrases }: { phrases: string[] }) {
   );
 }
 
-export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange }: Props) {
+export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onArtifactsChange, onArtifactOpenRequest }: Props) {
   const {
     loading, error, messages, entryIds, streamState,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
@@ -107,6 +109,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     notices, extensionDialog, extensionStatuses, extensionWidgets, respondToExtensionUi,
     isAutoModelSelection,
     agentPhase,
+    hasMoreBefore, loadingMoreContext,
     isNew,
     messagesEndRef, scrollContainerRef,
     lastUserMsgRef,
@@ -114,9 +117,11 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, handleAgentEventRef,
+    loadMoreContext,
   } = useAgentSession({
     session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSessionStatsPanelOpen,
+    onArtifactsChange, onArtifactOpenRequest,
   });
 
   const { soundEnabled, onSoundToggle, playDoneSound } = useAudio();
@@ -175,7 +180,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   useEffect(() => () => { onContextUsageChange?.(null); }, [onContextUsageChange]);
 
   const onDrop = useCallback((files: File[]) => {
-    chatInputRef?.current?.addImages(files);
+    chatInputRef?.current?.addFiles(files);
   }, [chatInputRef]);
 
   const { isDragOver, handleDragEnter, handleDragOver, handleDragLeave, handleDrop } = useDragDrop(onDrop);
@@ -353,6 +358,28 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               <ExtensionStatusBar statuses={extensionStatuses} />
               <ExtensionWidgets widgets={aboveEditorWidgets} />
 
+              {hasMoreBefore && (
+                <div style={{ display: "flex", justifyContent: "center", margin: "8px 0 14px" }}>
+                  <button
+                    type="button"
+                    onClick={loadMoreContext}
+                    disabled={loadingMoreContext}
+                    style={{
+                      height: 30,
+                      padding: "0 12px",
+                      border: "1px solid var(--border)",
+                      borderRadius: 6,
+                      background: "var(--bg-panel)",
+                      color: loadingMoreContext ? "var(--text-dim)" : "var(--text-muted)",
+                      cursor: loadingMoreContext ? "default" : "pointer",
+                      fontSize: 12,
+                    }}
+                  >
+                    {loadingMoreContext ? "Loading earlier messages..." : "Load earlier messages"}
+                  </button>
+                </div>
+              )}
+
             {(() => {
               const toolResultsMap = new Map<string, import("@/lib/types").ToolResultMessage>();
               for (const msg of messages) {
@@ -406,7 +433,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                   <div key={idx} ref={(el) => {
                     messageRefs.current[currentRefIdx] = el;
                     if (idx === lastUserIdx) { (lastUserMsgRef as { current: HTMLDivElement | null }).current = el; }
-                  }}>
+                  }} style={{ contentVisibility: "auto", containIntrinsicSize: "220px" }}>
                     {view}
                   </div>
                 );

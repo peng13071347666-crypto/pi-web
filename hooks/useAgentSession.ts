@@ -3,16 +3,21 @@
 import { useState, useCallback, useRef, useEffect, useReducer } from "react";
 import type {
   AgentMessage,
+  ArtifactItem,
+  AssistantMessage,
+  AttachedFileRef,
   ExtensionStatusItem,
   ExtensionUiRequest,
   ExtensionWidgetItem,
   SessionInfo,
   SessionTreeNode,
+  ToolCallContent,
 } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ToolEntry } from "@/components/ToolPanel";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import { encodeFilePathForApi, getFileName, normalizeFilePathSlashes } from "@/lib/file-paths";
 
 export interface SessionData {
   sessionId: string;
@@ -26,6 +31,15 @@ export interface SessionData {
     model: { provider: string; modelId: string } | null;
   };
 }
+
+type SessionContextData = SessionData["context"];
+type SessionCacheEntry = {
+  data: SessionData;
+  messages: AgentMessage[];
+  entryIds: string[];
+  hasMoreBefore: boolean;
+  oldestEntryId: string | null;
+};
 
 interface StreamingState {
   isStreaming: boolean;
@@ -138,6 +152,8 @@ export interface UseAgentSessionOptions {
   onSystemPromptChange?: (prompt: string | null) => void;
   onSessionStatsPanelOpen?: () => void;
   setToolPreset?: (preset: "none" | "default" | "full") => void;
+  onArtifactsChange?: (artifacts: ArtifactItem[]) => void;
+  onArtifactOpenRequest?: (filePath: string) => void;
 }
 
 export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -151,6 +167,9 @@ const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
+const INITIAL_CONTEXT_LIMIT = 240;
+const CONTEXT_PAGE_LIMIT = 240;
+const sessionDetailCache = new Map<string, SessionCacheEntry>();
 
 function createNoticeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -161,6 +180,80 @@ function createNoticeId(): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function emptyContext(): SessionContextData {
+  return {
+    messages: [],
+    entryIds: [],
+    thinkingLevel: "auto",
+    model: null,
+  };
+}
+
+function escapeFileAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function messageWithFileRefs(message: string, files?: AttachedFileRef[]): string {
+  if (!files?.length) return message;
+  const refs = files
+    .map((file) => `<file name="${escapeFileAttribute(file.path)}"></file>`)
+    .join("\n");
+  return [message.trim(), refs].filter(Boolean).join("\n\n");
+}
+
+function isAbsoluteLikePath(filePath: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(filePath)
+    || filePath.startsWith("\\\\")
+    || filePath.startsWith("//")
+    || filePath.startsWith("/");
+}
+
+function resolveToolPath(filePath: string, cwd: string | null | undefined): string {
+  if (!filePath) return filePath;
+  if (isAbsoluteLikePath(filePath) || !cwd) return filePath;
+  return `${normalizeFilePathSlashes(cwd).replace(/\/$/, "")}/${filePath.replace(/^\.?[\\/]/, "")}`;
+}
+
+function readToolInputPath(input: Record<string, unknown>): string | null {
+  const keys = ["path", "file_path", "filePath", "target_path", "targetPath", "target_file", "targetFile", "filename", "file"];
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function classifyArtifact(toolName: string, input: Record<string, unknown>): ArtifactItem["kind"] | null {
+  const lower = toolName.toLowerCase();
+  if (!readToolInputPath(input)) return null;
+  if (lower.includes("edit") || lower.includes("replace") || lower.includes("patch")) return "modified";
+  if (lower.includes("write") || lower.includes("create")) return "created";
+  if (lower.includes("read") || lower.includes("view") || lower.includes("open")) return "read";
+  return null;
+}
+
+async function fetchTextFileContent(filePath: string): Promise<{ content: string; language?: string } | null> {
+  try {
+    const encoded = encodeFilePathForApi(filePath);
+    const res = await fetch(`/api/files/${encoded}?type=read`);
+    if (!res.ok) return null;
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("application/json")) return null;
+    const data = await res.json() as { content?: unknown; language?: unknown };
+    if (typeof data.content !== "string") return null;
+    return {
+      content: data.content,
+      language: typeof data.language === "string" ? data.language : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function markOldestNoticeExiting(notices: NoticeItem[]): NoticeItem[] {
@@ -220,6 +313,7 @@ export interface ChatInputHandle {
   insertText: (text: string) => void;
   insertIfEmpty: (content: string) => void;
   addImages: (files: File[]) => void;
+  addFiles: (files: File[]) => void;
 }
 
 export interface AttachedImage {
@@ -246,6 +340,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
     session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSessionStatsPanelOpen,
+    onArtifactsChange, onArtifactOpenRequest,
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
@@ -283,10 +378,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
+  const [hasMoreBefore, setHasMoreBefore] = useState(false);
+  const [oldestEntryId, setOldestEntryId] = useState<string | null>(null);
+  const [loadingMoreContext, setLoadingMoreContext] = useState(false);
+  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const agentRunningRef = useRef(false);
+  const messagesRef = useRef<AgentMessage[]>([]);
+  const entryIdsRef = useRef<string[]>([]);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
   const initialScrollDoneRef = useRef(false);
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
@@ -299,6 +400,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
   const newSessionPromotedRef = useRef(false);
   const promptRunIdRef = useRef(0);
+  const loadSessionRequestRef = useRef(0);
+  const loadSessionAbortRef = useRef<AbortController | null>(null);
+  const loadContextRequestRef = useRef(0);
+  const pendingStreamMessageRef = useRef<Partial<AgentMessage> | null>(null);
+  const streamFrameRef = useRef<number | null>(null);
+  const artifactsRef = useRef<ArtifactItem[]>([]);
+  const artifactBeforeFetchesRef = useRef<Set<string>>(new Set());
+  const artifactAutoOpenRef = useRef<Set<string>>(new Set());
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -344,57 +453,167 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   })();
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
+  const loadSession = useCallback(async (
+    sid: string,
+    showLoading = false,
+    includeState = false,
+    metaOnly = false,
+  ) => {
+    const requestId = ++loadSessionRequestRef.current;
+    const cached = sessionDetailCache.get(sid);
     try {
-      if (showLoading) setLoading(true);
-      const url = includeState
-        ? `/api/sessions/${encodeURIComponent(sid)}?includeState`
-        : `/api/sessions/${encodeURIComponent(sid)}`;
-      const res = await fetch(url);
+      if (showLoading) {
+        if (cached) {
+          setData(cached.data);
+          setActiveLeafId(cached.data.leafId);
+          setMessages(cached.messages);
+          setEntryIds(cached.entryIds);
+          setHasMoreBefore(cached.hasMoreBefore);
+          setOldestEntryId(cached.oldestEntryId);
+          setLoading(false);
+        } else {
+          setLoading(true);
+        }
+      }
+
+      loadSessionAbortRef.current?.abort();
+      const controller = new AbortController();
+      loadSessionAbortRef.current = controller;
+      const params = new URLSearchParams();
+      if (includeState) params.set("includeState", "1");
+      if (metaOnly) params.set("meta", "1");
+      const query = params.toString();
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}${query ? `?${query}` : ""}`, {
+        signal: controller.signal,
+      });
+      if (requestId !== loadSessionRequestRef.current) return null;
       if (res.status === 404) {
         if (showLoading) {
           setData(null);
           setActiveLeafId(null);
           setMessages([]);
+          setEntryIds([]);
+          setHasMoreBefore(false);
+          setOldestEntryId(null);
           setError(null);
         }
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData & { agentState?: { running: boolean; state?: AgentStateResponse } };
-      setData(d);
-      setActiveLeafId(d.leafId);
-      setMessages(d.context.messages);
-      setEntryIds(d.context.entryIds ?? []);
+      const d = await res.json() as Omit<SessionData, "context"> & {
+        context?: SessionContextData;
+        agentState?: { running: boolean; state?: AgentStateResponse };
+      };
+      if (requestId !== loadSessionRequestRef.current) return null;
+
+      const nextContext = d.context ?? cached?.data.context ?? emptyContext();
+      const nextData: SessionData = {
+        sessionId: d.sessionId,
+        filePath: d.filePath,
+        tree: d.tree ?? [],
+        leafId: d.leafId ?? null,
+        context: nextContext,
+      };
+      const nextMessages = d.context?.messages ?? cached?.messages ?? [];
+      const nextEntryIds = d.context?.entryIds ?? cached?.entryIds ?? [];
+      const nextHasMoreBefore = cached?.hasMoreBefore ?? false;
+      const nextOldestEntryId = cached?.oldestEntryId ?? (nextEntryIds[0] ?? null);
+
+      setData(nextData);
+      setActiveLeafId(nextData.leafId);
+      setMessages(nextMessages);
+      setEntryIds(nextEntryIds);
+      setHasMoreBefore(nextHasMoreBefore);
+      setOldestEntryId(nextOldestEntryId);
+      sessionDetailCache.set(sid, {
+        data: nextData,
+        messages: nextMessages,
+        entryIds: nextEntryIds,
+        hasMoreBefore: nextHasMoreBefore,
+        oldestEntryId: nextOldestEntryId,
+      });
       setCurrentModelOverride(null);
       setError(null);
       if (d.agentState?.state?.extensionStatuses) setExtensionStatuses(d.agentState.state.extensionStatuses);
       if (d.agentState?.state?.extensionWidgets) setExtensionWidgets(d.agentState.state.extensionWidgets);
-      // If no live agent state, fall back to thinking level from session file
-      if (!d.agentState?.state?.thinkingLevel && d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
-        setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
+      if (!d.agentState?.state?.thinkingLevel && nextContext.thinkingLevel && nextContext.thinkingLevel !== "off") {
+        setThinkingLevel(nextContext.thinkingLevel as ThinkingLevelOption);
       }
-      return d.agentState ?? null;
+      return d.agentState ? { ...d.agentState, leafId: nextData.leafId } : { running: false, leafId: nextData.leafId };
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return null;
       setError(String(e));
       return null;
     } finally {
-      if (showLoading) setLoading(false);
+      if (requestId === loadSessionRequestRef.current && showLoading) setLoading(false);
     }
   }, []);
 
-  const loadContext = useCallback(async (sid: string, leafId: string | null) => {
+  const loadContext = useCallback(async (
+    sid: string,
+    leafId: string | null,
+    options: { limit?: number; beforeEntryId?: string | null; prepend?: boolean } = {},
+  ) => {
+    const requestId = ++loadContextRequestRef.current;
+    const { limit, beforeEntryId, prepend = false } = options;
+    if (prepend) setLoadingMoreContext(true);
     try {
-      const url = leafId
-        ? `/api/sessions/${encodeURIComponent(sid)}/context?leafId=${encodeURIComponent(leafId)}`
-        : `/api/sessions/${encodeURIComponent(sid)}/context`;
-      const res = await fetch(url);
+      const params = new URLSearchParams();
+      if (leafId) params.set("leafId", leafId);
+      if (limit) params.set("limit", String(limit));
+      if (beforeEntryId) params.set("beforeEntryId", beforeEntryId);
+      const query = params.toString();
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/context${query ? `?${query}` : ""}`);
+      if (requestId !== loadContextRequestRef.current) return null;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
-      setMessages(d.context.messages);
-      setEntryIds(d.context.entryIds ?? []);
+      const d = await res.json() as {
+        context: SessionContextData;
+        page?: { hasMoreBefore?: boolean; beforeEntryId?: string | null };
+      };
+      if (requestId !== loadContextRequestRef.current) return null;
+
+      let nextMessages = d.context.messages;
+      let nextEntryIds = d.context.entryIds ?? [];
+      if (prepend) {
+        nextMessages = [...d.context.messages, ...messagesRef.current];
+        nextEntryIds = [...(d.context.entryIds ?? []), ...entryIdsRef.current];
+        setMessages(nextMessages);
+        setEntryIds(nextEntryIds);
+      } else {
+        setMessages(nextMessages);
+        setEntryIds(nextEntryIds);
+      }
+
+      const nextHasMoreBefore = d.page?.hasMoreBefore ?? false;
+      const nextOldestEntryId = d.page?.beforeEntryId ?? nextEntryIds[0] ?? null;
+      setHasMoreBefore(nextHasMoreBefore);
+      setOldestEntryId(nextOldestEntryId);
+
+      setData((prev) => {
+        if (!prev || prev.sessionId !== sid) return prev;
+        const nextData = {
+          ...prev,
+          context: {
+            ...d.context,
+            messages: nextMessages,
+            entryIds: nextEntryIds,
+          },
+        };
+        sessionDetailCache.set(sid, {
+          data: nextData,
+          messages: nextMessages,
+          entryIds: nextEntryIds,
+          hasMoreBefore: nextHasMoreBefore,
+          oldestEntryId: nextOldestEntryId,
+        });
+        return nextData;
+      });
+      return d.context;
     } catch (e) {
       console.error("Failed to load context:", e);
+      return null;
+    } finally {
+      if (requestId === loadContextRequestRef.current && prepend) setLoadingMoreContext(false);
     }
   }, []);
 
@@ -554,6 +773,100 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     });
   }, []);
 
+  const queueStreamMessage = useCallback((message: Partial<AgentMessage>) => {
+    pendingStreamMessageRef.current = message;
+    if (streamFrameRef.current !== null) return;
+    streamFrameRef.current = requestAnimationFrame(() => {
+      streamFrameRef.current = null;
+      const next = pendingStreamMessageRef.current;
+      pendingStreamMessageRef.current = null;
+      if (next) dispatch({ type: "update", message: next });
+    });
+  }, []);
+
+  const upsertArtifact = useCallback((artifact: ArtifactItem, autoOpen: boolean) => {
+    setArtifacts((prev) => {
+      const index = prev.findIndex((item) => item.id === artifact.id);
+      if (index === -1) {
+        return [artifact, ...prev].slice(0, 80);
+      }
+      const next = [...prev];
+      next[index] = { ...next[index], ...artifact, updatedAt: Date.now() };
+      return next;
+    });
+    if (autoOpen && !artifactAutoOpenRef.current.has(artifact.id)) {
+      artifactAutoOpenRef.current.add(artifact.id);
+      onArtifactOpenRequest?.(artifact.filePath);
+    }
+  }, [onArtifactOpenRequest]);
+
+  const captureArtifactBefore = useCallback((artifactId: string, filePath: string) => {
+    if (artifactBeforeFetchesRef.current.has(artifactId)) return;
+    artifactBeforeFetchesRef.current.add(artifactId);
+    void fetchTextFileContent(filePath).then((result) => {
+      if (!result) return;
+      setArtifacts((prev) => prev.map((item) => (
+        item.id === artifactId
+          ? { ...item, beforeContent: result.content, language: result.language ?? item.language }
+          : item
+      )));
+    });
+  }, []);
+
+  const trackArtifactsFromMessage = useCallback((msg: Partial<AgentMessage>) => {
+    if (msg.role !== "assistant") return;
+    const content = (msg as Partial<AssistantMessage>).content ?? [];
+    for (const block of content) {
+      if (block.type !== "toolCall") continue;
+      const call = block as ToolCallContent;
+      const kind = classifyArtifact(call.toolName, call.input ?? {});
+      if (!kind) continue;
+      const rawPath = readToolInputPath(call.input ?? {});
+      if (!rawPath) continue;
+      const filePath = resolveToolPath(rawPath, session?.cwd ?? newSessionCwd);
+      const id = call.toolCallId || `${kind}:${filePath}:${call.toolName}`;
+      const artifact: ArtifactItem = {
+        id,
+        filePath,
+        fileName: getFileName(filePath),
+        kind,
+        status: artifactsRef.current.find((item) => item.id === id)?.status ?? "pending",
+        toolName: call.toolName,
+        toolCallId: call.toolCallId,
+        updatedAt: Date.now(),
+      };
+      upsertArtifact(artifact, kind === "created" || kind === "modified");
+      if (kind === "modified") captureArtifactBefore(id, filePath);
+      if (kind === "created" && typeof call.input.content === "string") {
+        setArtifacts((prev) => prev.map((item) => (
+          item.id === id
+            ? { ...item, afterContent: call.input.content as string, status: item.status }
+            : item
+        )));
+      }
+    }
+  }, [captureArtifactBefore, newSessionCwd, session?.cwd, upsertArtifact]);
+
+  const completeArtifact = useCallback((toolCallId: string, isError?: boolean, errorMessage?: string) => {
+    const current = artifactsRef.current.find((item) => item.toolCallId === toolCallId || item.id === toolCallId);
+    if (!current) return;
+    setArtifacts((prev) => prev.map((item) => (
+      item.id === current.id
+        ? { ...item, status: isError ? "error" : "done", errorMessage, updatedAt: Date.now() }
+        : item
+    )));
+    if (!isError && (current.kind === "created" || current.kind === "modified")) {
+      void fetchTextFileContent(current.filePath).then((result) => {
+        if (!result) return;
+        setArtifacts((prev) => prev.map((item) => (
+          item.id === current.id
+            ? { ...item, afterContent: result.content, language: result.language ?? item.language, updatedAt: Date.now() }
+            : item
+        )));
+      });
+    }
+  }, []);
+
   const handleExtensionUiRequest = useCallback((request: ExtensionUiRequest) => {
     switch (request.method) {
       case "select":
@@ -599,7 +912,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId?: number) => {
     try {
-      if (sid) await loadSession(sid);
+      if (sid) {
+        const loaded = await loadSession(sid, false, false, true);
+        const leafId = loaded?.leafId ?? sessionDetailCache.get(sid)?.data.leafId ?? activeLeafId;
+        await loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+      }
     } finally {
       if (runId !== undefined && promptRunIdRef.current !== runId) return;
       if (!agentRunningRef.current) return;
@@ -610,7 +927,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       dispatch({ type: "end" });
       onAgentEnd?.();
     }
-  }, [loadSession, onAgentEnd]);
+  }, [activeLeafId, loadContext, loadSession, onAgentEnd]);
 
   const waitForPromptSettlement = useCallback(async (sid: string, runId?: number) => {
     await delay(PROMPT_SETTLE_INITIAL_DELAY_MS);
@@ -639,6 +956,28 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     agentRunningRef.current = agentRunning;
   }, [agentRunning]);
 
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    entryIdsRef.current = entryIds;
+  }, [entryIds]);
+
+  useEffect(() => {
+    artifactsRef.current = artifacts;
+    onArtifactsChange?.(artifacts);
+  }, [artifacts, onArtifactsChange]);
+
+  useEffect(() => {
+    return () => {
+      if (streamFrameRef.current !== null) {
+        cancelAnimationFrame(streamFrameRef.current);
+        streamFrameRef.current = null;
+      }
+    };
+  }, []);
+
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
       case "agent_start":
@@ -654,7 +993,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setRetryInfo(null);
         dispatch({ type: "end" });
         if (sessionIdRef.current) {
-          loadSession(sessionIdRef.current);
+          const sid = sessionIdRef.current;
+          loadSession(sid, false, false, true).then((loaded) => {
+            const leafId = loaded?.leafId ?? sessionDetailCache.get(sid)?.data.leafId ?? activeLeafId;
+            void loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+          });
           fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
             .then((r) => r.json())
             .then((d: { state?: AgentStateResponse }) => {
@@ -681,7 +1024,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           break;
         }
         if (msg) {
-          dispatch({ type: "update", message: normalizeToolCalls(msg as AgentMessage) });
+          const normalized = normalizeToolCalls(msg as AgentMessage);
+          trackArtifactsFromMessage(normalized);
+          queueStreamMessage(normalized);
         }
         setAgentPhase(null);
         break;
@@ -689,7 +1034,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "message_end": {
         const completed = event.message as AgentMessage | undefined;
         if (completed && completed.role !== "user") {
-          setMessages((prev) => [...prev, normalizeToolCalls(completed)]);
+          const normalized = normalizeToolCalls(completed);
+          trackArtifactsFromMessage(normalized);
+          setMessages((prev) => [...prev, normalized]);
         }
         dispatch({ type: "reset" });
         setAgentPhase({ kind: "waiting_model" });
@@ -707,6 +1054,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       case "tool_execution_end": {
         const id = event.toolCallId as string;
+        completeArtifact(id, Boolean(event.isError), event.errorMessage as string | undefined);
         setAgentPhase((prev) => {
           if (prev?.kind !== "running_tools") return prev;
           const tools = prev.tools.filter((t) => t.id !== id);
@@ -735,29 +1083,39 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setCompactResult(null);
         } else if (!event.aborted) {
           setCompactResult(readCompactResult(event.result, (event.reason as string | undefined) ?? "auto"));
-          if (sessionIdRef.current) loadSession(sessionIdRef.current);
+          if (sessionIdRef.current) {
+            const sid = sessionIdRef.current;
+            loadSession(sid, false, false, true).then((loaded) => {
+              const leafId = loaded?.leafId ?? sessionDetailCache.get(sid)?.data.leafId ?? activeLeafId;
+              void loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+            });
+          }
         }
         break;
       case "extension_ui_request":
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [addNotice, finishPromptWithoutStream, handleExtensionUiRequest, loadSession, onAgentEnd]);
+  }, [activeLeafId, addNotice, completeArtifact, finishPromptWithoutStream, handleExtensionUiRequest, loadContext, loadSession, onAgentEnd, queueStreamMessage, trackArtifactsFromMessage]);
   handleAgentEventRef.current = handleAgentEvent;
 
-  const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleSend = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {
     const trimmedMessage = message.trim();
-    if (!trimmedMessage && !images?.length) return;
+    if (!trimmedMessage && !images?.length && !files?.length) return;
     if (agentRunning) return;
-    const isSlashCommandPrompt = !images?.length && trimmedMessage.startsWith("/");
+    if (toolPreset === "none" && files?.length) {
+      addNotice({ type: "warning", message: "Files were attached as paths. Enable tools if you want the model to read them." });
+    }
+    const messageForAgent = messageWithFileRefs(trimmedMessage, files);
+    const isSlashCommandPrompt = !images?.length && !files?.length && trimmedMessage.startsWith("/");
     const promptRunId = promptRunIdRef.current + 1;
 
     const imageBlocks = images?.map((img) => ({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } }));
     const userMsg: AgentMessage = {
       role: "user",
       content: imageBlocks?.length
-        ? [...(message.trim() ? [{ type: "text" as const, text: message }] : []), ...imageBlocks]
-        : message,
+        ? [...(messageForAgent.trim() ? [{ type: "text" as const, text: messageForAgent }] : []), ...imageBlocks]
+        : messageForAgent,
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, userMsg]);
@@ -786,10 +1144,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           await connectEvents(existingSid);
           await sendAgentCommand(existingSid, {
             type: "prompt",
-            message,
+            message: messageForAgent,
             ...(piImages?.length ? { images: piImages } : {}),
           });
-          promoteNewSession(1, message);
+          promoteNewSession(1, messageForAgent);
         } else {
           if (selectedModel) setPendingModel(selectedModel);
           const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
@@ -813,17 +1171,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           await connectEvents(realId);
           await sendAgentCommand(realId, {
             type: "prompt",
-            message,
+            message: messageForAgent,
             ...(piImages?.length ? { images: piImages } : {}),
           });
-          promoteNewSession(1, message);
+          promoteNewSession(1, messageForAgent);
         }
       } else if (session) {
         sentSessionId = session.id;
         await connectEvents(session.id);
         await sendAgentCommand(session.id, {
           type: "prompt",
-          message,
+          message: messageForAgent,
           ...(piImages?.length ? { images: piImages } : {}),
         });
       }
@@ -837,7 +1195,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
+  }, [addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -874,18 +1232,28 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!sid) return;
     sendAgentCommand(sid, { type: "navigate_tree", targetId: entryId }).catch(() => {});
     setActiveLeafId(entryId);
-    await loadContext(sid, entryId);
+    await loadContext(sid, entryId, { limit: INITIAL_CONTEXT_LIMIT });
   }, [loadContext]);
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
     setActiveLeafId(leafId);
     const sid = sessionIdRef.current;
     if (!sid) return;
-    await loadContext(sid, leafId);
+    await loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
     if (leafId) {
       sendAgentCommand(sid, { type: "navigate_tree", targetId: leafId }).catch(() => {});
     }
   }, [loadContext]);
+
+  const loadMoreContext = useCallback(async () => {
+    const sid = sessionIdRef.current;
+    if (!sid || !hasMoreBefore || !oldestEntryId || loadingMoreContext) return;
+    await loadContext(sid, activeLeafId, {
+      limit: CONTEXT_PAGE_LIMIT,
+      beforeEntryId: oldestEntryId,
+      prepend: true,
+    });
+  }, [activeLeafId, hasMoreBefore, loadContext, loadingMoreContext, oldestEntryId]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
     if (isNew) {
@@ -919,14 +1287,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       const result = await sendAgentCommand<CompactCommandResult>(sid, { type: "compact" });
       setCompactResult(readCompactResult(result, "manual"));
-      await loadSession(sid, true);
+      const loaded = await loadSession(sid, true, false, true);
+      await loadContext(sid, loaded?.leafId ?? activeLeafId, { limit: INITIAL_CONTEXT_LIMIT });
     } catch (e) {
       setCompactError(e instanceof Error ? e.message : String(e));
       setCompactResult(null);
     } finally {
       setIsCompacting(false);
     }
-  }, [isCompacting, loadSession]);
+  }, [activeLeafId, isCompacting, loadContext, loadSession]);
 
   const handleBuiltinSlashCommand = useCallback(async (text: string): Promise<BuiltinSlashCommandResult> => {
     if (!text.startsWith("/")) return { handled: false };
@@ -958,7 +1327,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             ...(args ? { customInstructions: args } : {}),
           });
           setCompactResult(readCompactResult(result, "manual"));
-          if (await loadSession(sid, true)) promoteNewSession();
+          const loaded = await loadSession(sid, true, false, true);
+          await loadContext(sid, loaded?.leafId ?? activeLeafId, { limit: INITIAL_CONTEXT_LIMIT });
+          if (loaded) promoteNewSession();
           return complete({ handled: true, message: "Compacted context" });
         }
 
@@ -966,7 +1337,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (!sid) return complete({ handled: true, error: "No active session to name" });
           if (!args) return complete({ handled: true, error: "Usage: /name <name>" });
           await sendAgentCommand(sid, { type: "set_session_name", name: args });
-          if (await loadSession(sid)) promoteNewSession();
+          if (await loadSession(sid, false, false, true)) promoteNewSession();
           return complete({ handled: true, message: `Session renamed to ${args}` });
         }
 
@@ -997,17 +1368,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (commandName === "compact") setIsCompacting(false);
     }
-  }, [addNotice, ensureNewSession, isCompacting, loadSession, promoteNewSession, onSessionStatsPanelOpen]);
+  }, [activeLeafId, addNotice, ensureNewSession, isCompacting, loadContext, loadSession, promoteNewSession, onSessionStatsPanelOpen]);
 
-  const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleSteer = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${message}`, timestamp: Date.now() } as AgentMessage]);
+    const messageForAgent = messageWithFileRefs(message, files);
+    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${messageForAgent}`, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "steer",
-        message,
+        message: messageForAgent,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
@@ -1019,19 +1391,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     message: string,
     behavior: "steer" | "followUp",
     images?: AttachedImage[],
+    files?: AttachedFileRef[],
   ) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const messageForAgent = messageWithFileRefs(message, files);
     setMessages((prev) => [...prev, {
       role: "user",
-      content: behavior === "steer" ? `[steer] ${message}` : message,
+      content: behavior === "steer" ? `[steer] ${messageForAgent}` : messageForAgent,
       timestamp: Date.now(),
     } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "prompt",
-        message,
+        message: messageForAgent,
         streamingBehavior: behavior,
         ...(piImages?.length ? { images: piImages } : {}),
       });
@@ -1040,15 +1414,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
+  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    setMessages((prev) => [...prev, { role: "user", content: message, timestamp: Date.now() } as AgentMessage]);
+    const messageForAgent = messageWithFileRefs(message, files);
+    setMessages((prev) => [...prev, { role: "user", content: messageForAgent, timestamp: Date.now() } as AgentMessage]);
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     try {
       await sendAgentCommand(sid, {
         type: "follow_up",
-        message,
+        message: messageForAgent,
         ...(piImages?.length ? { images: piImages } : {}),
       });
     } catch (e) {
@@ -1124,7 +1499,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     if (session) {
       sessionIdRef.current = session.id;
-      loadSession(session.id, true, true).then((agentState) => {
+      loadSession(session.id, true, true, true).then((agentState) => {
+        const leafId = agentState?.leafId ?? sessionDetailCache.get(session.id)?.data.leafId ?? null;
+        void loadContext(session.id, leafId, { limit: INITIAL_CONTEXT_LIMIT });
         if (agentState?.running) {
           loadTools(session.id);
           if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
@@ -1149,6 +1526,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       });
     }
     return () => {
+      loadSessionAbortRef.current?.abort();
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
     };
@@ -1272,6 +1650,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     notices: noticeState.visible, extensionDialog, extensionStatuses, extensionWidgets, respondToExtensionUi,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,
+    hasMoreBefore, loadingMoreContext, artifacts,
     isNew,
     // Refs
     sessionIdRef, eventSourceRef, messagesEndRef, scrollContainerRef,
@@ -1280,7 +1659,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, setActiveLeafId, setData, setMessages,
+    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, loadMoreContext, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
     // Subscriptions
     handleAgentEventRef,

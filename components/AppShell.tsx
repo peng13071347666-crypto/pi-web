@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
 import { FileViewer } from "./FileViewer";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import { TabBar, type Tab } from "./TabBar";
 import { ModelsConfig } from "./ModelsConfig";
 import { SkillsConfig } from "./SkillsConfig";
@@ -13,7 +14,7 @@ import { MultimodalProxyConfig } from "./MultimodalProxyConfig";
 import { BranchNavigator } from "./BranchNavigator";
 import { VersionBanner } from "./VersionBanner";
 import { useTheme } from "@/hooks/useTheme";
-import type { SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { ArtifactItem, SessionInfo, SessionTreeNode } from "@/lib/types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 
@@ -134,6 +135,9 @@ export function AppShell() {
   const [fileTabs, setFileTabs] = useState<Tab[]>([]);
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [rightPanelMode, setRightPanelMode] = useState<"artifacts" | "files">("files");
+  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
+  const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
 
   const handleAtMention = useCallback((relativePath: string) => {
     chatInputRef.current?.insertText("`" + relativePath + "`");
@@ -251,8 +255,26 @@ export function AppShell() {
       return [...prev, { id: tabId, label: fileName, filePath }];
     });
     setActiveFileTabId(tabId);
+    setRightPanelMode("files");
     setRightPanelOpen(true);
   }, []);
+
+  const handleArtifactsChange = useCallback((nextArtifacts: ArtifactItem[]) => {
+    setArtifacts(nextArtifacts);
+    setActiveArtifactId((current) => {
+      if (current && nextArtifacts.some((item) => item.id === current)) return current;
+      return nextArtifacts[0]?.id ?? null;
+    });
+  }, []);
+
+  const handleArtifactOpenRequest = useCallback((filePath: string) => {
+    setRightPanelMode("artifacts");
+    setRightPanelOpen(true);
+    setActiveArtifactId((current) => {
+      const match = artifacts.find((item) => item.filePath === filePath);
+      return match?.id ?? current;
+    });
+  }, [artifacts]);
 
   const handleCloseFileTab = useCallback((tabId: string) => {
     setFileTabs((prev) => {
@@ -919,6 +941,8 @@ export function AppShell() {
               onSessionStatsChange={handleSessionStatsChange}
               onSessionStatsPanelOpen={openSessionStatsPanel}
               onContextUsageChange={handleContextUsageChange}
+              onArtifactsChange={handleArtifactsChange}
+              onArtifactOpenRequest={handleArtifactOpenRequest}
             />
           ) : showPlaceholder ? (
             activeCwd ? (
@@ -955,20 +979,58 @@ export function AppShell() {
       >
         {/* Right panel tab bar */}
         <div style={{ display: "flex", alignItems: "center", flexShrink: 0, background: "var(--bg-panel)", borderBottom: "1px solid var(--border)", height: 36 }}>
+          <div style={{ display: "flex", alignItems: "stretch", height: "100%", borderRight: "1px solid var(--border)" }}>
+            {(["artifacts", "files"] as const).map((mode) => {
+              const active = rightPanelMode === mode;
+              const label = mode === "artifacts" ? `Artifacts${artifacts.length ? ` ${artifacts.length}` : ""}` : "Files";
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => {
+                    setRightPanelMode(mode);
+                    setRightPanelOpen(true);
+                  }}
+                  style={{
+                    height: "100%",
+                    padding: "0 10px",
+                    border: "none",
+                    borderTop: active ? "2px solid var(--accent)" : "2px solid transparent",
+                    background: active ? "var(--bg-selected)" : "transparent",
+                    color: active ? "var(--text)" : "var(--text-muted)",
+                    cursor: "pointer",
+                    fontSize: 11,
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
           <div style={{ flex: 1, overflow: "hidden" }}>
-            <TabBar
-              tabs={fileTabs}
-              activeTabId={activeFileTabId ?? ""}
-              onSelectTab={setActiveFileTabId}
-              onCloseTab={handleCloseFileTab}
-            />
+            {rightPanelMode === "files" && (
+              <TabBar
+                tabs={fileTabs}
+                activeTabId={activeFileTabId ?? ""}
+                onSelectTab={setActiveFileTabId}
+                onCloseTab={handleCloseFileTab}
+              />
+            )}
           </div>
 
         </div>
 
         {/* File content */}
         <div style={{ flex: 1, overflow: "hidden" }}>
-          {activeFileTab?.filePath ? (
+          {rightPanelMode === "artifacts" ? (
+            <ArtifactsPanel
+              artifacts={artifacts}
+              activeArtifactId={activeArtifactId}
+              onSelectArtifact={setActiveArtifactId}
+              cwd={activeCwd ?? undefined}
+            />
+          ) : activeFileTab?.filePath ? (
             <FileViewer filePath={activeFileTab.filePath} cwd={activeCwd ?? undefined} />
           ) : (
             <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>

@@ -282,6 +282,35 @@ export interface SessionContext {
   model: { provider: string; modelId: string } | null;
 }
 
+export type AttachedFilePreviewKind = "text" | "image" | "audio" | "pdf" | "docx" | "binary";
+
+export interface AttachedFileRef {
+  name: string;
+  size: number;
+  mimeType: string;
+  path: string;
+  previewKind: AttachedFilePreviewKind;
+}
+
+export type ArtifactKind = "read" | "created" | "modified" | "shell";
+export type ArtifactStatus = "pending" | "done" | "error";
+
+export interface ArtifactItem {
+  id: string;
+  filePath: string;
+  fileName: string;
+  kind: ArtifactKind;
+  status: ArtifactStatus;
+  toolName?: string;
+  toolCallId?: string;
+  previewKind?: AttachedFilePreviewKind;
+  beforeContent?: string;
+  afterContent?: string;
+  language?: string;
+  errorMessage?: string;
+  updatedAt: number;
+}
+
 // RPC types
 export interface RpcSessionState {
   model?: { provider: string; id: string; contextWindow?: number };

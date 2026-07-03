@@ -105,12 +105,20 @@ export function ChatMinimap({ messages, streamingMessage, scrollContainer, messa
     let refIndex = 0;
 
     const allMessages = allMessagesRef.current;
+    const visibleCount = allMessages.reduce((count, msg) => (
+      msg.role === "user" || msg.role === "assistant" ? count + 1 : count
+    ), 0);
+    const sampleStep = visibleCount > 280 ? Math.ceil(visibleCount / 220) : 1;
+    let visibleIndex = 0;
     for (let i = 0; i < allMessages.length; i++) {
       const msg = allMessages[i];
       if (msg.role !== "user" && msg.role !== "assistant") continue;
 
       const el = refs?.[refIndex];
       refIndex++;
+      const shouldSample = msg.role === "user" || visibleIndex % sampleStep === 0 || i >= allMessages.length - 6;
+      visibleIndex++;
+      if (!shouldSample) continue;
 
       if (!hasTextContent(msg)) continue;
 

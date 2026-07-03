@@ -148,7 +148,7 @@ function diffLines(oldLines: string[], newLines: string[]): DiffLine[] {
   ];
 }
 
-function DiffView({ oldContent, newContent }: { oldContent: string; newContent: string; language: string }) {
+export function DiffView({ oldContent, newContent }: { oldContent: string; newContent: string; language: string }) {
   const oldLines = oldContent.split("\n");
   const newLines = newContent.split("\n");
   const diff = diffLines(oldLines, newLines);
