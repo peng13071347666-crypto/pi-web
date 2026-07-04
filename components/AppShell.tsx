@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
@@ -14,8 +14,10 @@ import { MultimodalProxyConfig } from "./MultimodalProxyConfig";
 import { BranchNavigator } from "./BranchNavigator";
 import { VersionBanner } from "./VersionBanner";
 import { useTheme } from "@/hooks/useTheme";
+import { encodeFilePathForApi, getFileName } from "@/lib/file-paths";
 import type { ArtifactItem, SessionInfo, SessionTreeNode } from "@/lib/types";
 import type { ChatInputHandle } from "./ChatInput";
+import type { OpenPathAction } from "./ArtifactCards";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 
 type SessionCopyField = "file" | "id";
@@ -138,6 +140,37 @@ export function AppShell() {
   const [rightPanelMode, setRightPanelMode] = useState<"artifacts" | "files">("files");
   const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
   const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
+  const outputArtifacts = artifacts.filter((item) => item.kind === "created" || item.kind === "modified");
+  const [rightPanelWidth, setRightPanelWidth] = useState(720);
+
+  const clampRightPanelWidth = useCallback((width: number) => {
+    if (typeof window === "undefined") return Math.min(Math.max(width, 340), 1180);
+    const max = Math.max(360, window.innerWidth - 380);
+    return Math.min(Math.max(width, 340), Math.min(max, 1180));
+  }, []);
+
+  const handleRightPanelResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!rightPanelOpen) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = rightPanelWidth;
+    const onMove = (moveEvent: PointerEvent) => {
+      setRightPanelWidth(clampRightPanelWidth(startWidth - (moveEvent.clientX - startX)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }, [clampRightPanelWidth, rightPanelOpen, rightPanelWidth]);
+
+  useEffect(() => {
+    setRightPanelWidth((width) => clampRightPanelWidth(width === 720 ? Math.round(window.innerWidth * 0.44) : width));
+    const onResize = () => setRightPanelWidth((width) => clampRightPanelWidth(width));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [clampRightPanelWidth]);
 
   const handleAtMention = useCallback((relativePath: string) => {
     chatInputRef.current?.insertText("`" + relativePath + "`");
@@ -259,11 +292,33 @@ export function AppShell() {
     setRightPanelOpen(true);
   }, []);
 
+  const handlePreviewFile = useCallback((filePath: string) => {
+    handleOpenFile(filePath, getFileName(filePath));
+  }, [handleOpenFile]);
+
+  const handleOpenPathRequest = useCallback(async (filePath: string, action: OpenPathAction) => {
+    try {
+      const encoded = encodeFilePathForApi(filePath);
+      const res = await fetch(`/api/files/${encoded}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({})) as { error?: string };
+        console.warn(`Failed to open path: ${data.error ?? `HTTP ${res.status}`}`);
+      }
+    } catch (error) {
+      console.warn("Failed to open path:", error);
+    }
+  }, []);
+
   const handleArtifactsChange = useCallback((nextArtifacts: ArtifactItem[]) => {
     setArtifacts(nextArtifacts);
+    const nextOutputArtifacts = nextArtifacts.filter((item) => item.kind === "created" || item.kind === "modified");
     setActiveArtifactId((current) => {
-      if (current && nextArtifacts.some((item) => item.id === current)) return current;
-      return nextArtifacts[0]?.id ?? null;
+      if (current && nextOutputArtifacts.some((item) => item.id === current)) return current;
+      return nextOutputArtifacts[0]?.id ?? null;
     });
   }, []);
 
@@ -271,10 +326,24 @@ export function AppShell() {
     setRightPanelMode("artifacts");
     setRightPanelOpen(true);
     setActiveArtifactId((current) => {
-      const match = artifacts.find((item) => item.filePath === filePath);
+      const match = artifacts.find((item) => item.filePath === filePath && (item.kind === "created" || item.kind === "modified"));
       return match?.id ?? current;
     });
   }, [artifacts]);
+
+  const handleArtifactPreviewRequest = useCallback((artifactId: string) => {
+    setActiveArtifactId(artifactId);
+    setRightPanelMode("artifacts");
+    setRightPanelOpen(true);
+  }, []);
+
+  const handleReviewArtifactsRequest = useCallback((artifactIds: string[]) => {
+    setActiveArtifactId((current) => (
+      current && artifactIds.includes(current) ? current : artifactIds[0] ?? current
+    ));
+    setRightPanelMode("artifacts");
+    setRightPanelOpen(true);
+  }, []);
 
   const handleCloseFileTab = useCallback((tabId: string) => {
     setFileTabs((prev) => {
@@ -943,6 +1012,10 @@ export function AppShell() {
               onContextUsageChange={handleContextUsageChange}
               onArtifactsChange={handleArtifactsChange}
               onArtifactOpenRequest={handleArtifactOpenRequest}
+              onArtifactPreviewRequest={handleArtifactPreviewRequest}
+              onReviewArtifactsRequest={handleReviewArtifactsRequest}
+              onFilePreviewRequest={handlePreviewFile}
+              onOpenPathRequest={handleOpenPathRequest}
             />
           ) : showPlaceholder ? (
             activeCwd ? (
@@ -971,18 +1044,48 @@ export function AppShell() {
       <div
         className={`right-panel-container${rightPanelOpen ? " right-panel-open" : " right-panel-closed"}`}
         style={{
+          "--right-panel-width": `${rightPanelWidth}px`,
+          position: "relative",
           display: "flex",
           flexDirection: "column",
-          borderLeft: "1px solid var(--border)",
+          flexGrow: 0,
+          flexShrink: 0,
+          flexBasis: rightPanelOpen ? rightPanelWidth : 0,
+          width: rightPanelOpen ? rightPanelWidth : 0,
+          minWidth: rightPanelOpen ? Math.min(rightPanelWidth, 340) : 0,
+          maxWidth: rightPanelOpen ? "calc(100vw - 360px)" : 0,
+          overflow: "hidden",
+          transition: "width 0.2s ease, min-width 0.2s ease",
+          borderLeft: rightPanelOpen ? "1px solid var(--border)" : "none",
           background: "var(--bg)",
-        }}
+        } as CSSProperties}
       >
+        {rightPanelOpen && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            title="Drag to resize preview panel"
+            onPointerDown={handleRightPanelResizeStart}
+            style={{
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              left: -4,
+              width: 8,
+              minWidth: 0,
+              maxWidth: 8,
+              zIndex: 20,
+              cursor: "col-resize",
+              touchAction: "none",
+            }}
+          />
+        )}
         {/* Right panel tab bar */}
-        <div style={{ display: "flex", alignItems: "center", flexShrink: 0, background: "var(--bg-panel)", borderBottom: "1px solid var(--border)", height: 36 }}>
+        <div style={{ width: "100%", minWidth: 0, boxSizing: "border-box", display: "flex", alignItems: "center", flexShrink: 0, background: "var(--bg-panel)", borderBottom: "1px solid var(--border)", height: 36 }}>
           <div style={{ display: "flex", alignItems: "stretch", height: "100%", borderRight: "1px solid var(--border)" }}>
             {(["artifacts", "files"] as const).map((mode) => {
               const active = rightPanelMode === mode;
-              const label = mode === "artifacts" ? `Artifacts${artifacts.length ? ` ${artifacts.length}` : ""}` : "Files";
+              const label = mode === "artifacts" ? `Artifacts${outputArtifacts.length ? ` ${outputArtifacts.length}` : ""}` : "Files";
               return (
                 <button
                   key={mode}
@@ -1022,13 +1125,14 @@ export function AppShell() {
         </div>
 
         {/* File content */}
-        <div style={{ flex: 1, overflow: "hidden" }}>
+        <div style={{ flex: 1, width: "100%", minWidth: 0, overflow: "hidden" }}>
           {rightPanelMode === "artifacts" ? (
             <ArtifactsPanel
-              artifacts={artifacts}
+              artifacts={outputArtifacts}
               activeArtifactId={activeArtifactId}
               onSelectArtifact={setActiveArtifactId}
               cwd={activeCwd ?? undefined}
+              onOpenPath={handleOpenPathRequest}
             />
           ) : activeFileTab?.filePath ? (
             <FileViewer filePath={activeFileTab.filePath} cwd={activeCwd ?? undefined} />

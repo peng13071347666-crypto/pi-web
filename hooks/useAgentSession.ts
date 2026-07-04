@@ -191,6 +191,15 @@ function emptyContext(): SessionContextData {
   };
 }
 
+function assistantContentSignature(message: AgentMessage): string | null {
+  if (message.role !== "assistant") return null;
+  try {
+    return JSON.stringify((message as AssistantMessage).content ?? []);
+  } catch {
+    return null;
+  }
+}
+
 function escapeFileAttribute(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -236,6 +245,80 @@ function classifyArtifact(toolName: string, input: Record<string, unknown>): Art
   if (lower.includes("write") || lower.includes("create")) return "created";
   if (lower.includes("read") || lower.includes("view") || lower.includes("open")) return "read";
   return null;
+}
+
+function isOutputArtifactKind(kind: ArtifactItem["kind"] | null): kind is "created" | "modified" {
+  return kind === "created" || kind === "modified";
+}
+
+function readInlineArtifactContent(input: Record<string, unknown>): string | undefined {
+  return typeof input.content === "string" ? input.content : undefined;
+}
+
+function applyEditToContent(beforeContent: string | undefined, input: Record<string, unknown>): string | undefined {
+  if (beforeContent === undefined) return undefined;
+  const oldString = typeof input.old_string === "string"
+    ? input.old_string
+    : (typeof input.oldString === "string" ? input.oldString : undefined);
+  const newString = typeof input.new_string === "string"
+    ? input.new_string
+    : (typeof input.newString === "string" ? input.newString : undefined);
+  if (oldString === undefined || newString === undefined || !beforeContent.includes(oldString)) return undefined;
+  if (input.replace_all === true || input.replaceAll === true) {
+    return beforeContent.split(oldString).join(newString);
+  }
+  return beforeContent.replace(oldString, newString);
+}
+
+function readToolResultText(msg: AgentMessage): string | null {
+  if (msg.role !== "toolResult") return null;
+  const text = msg.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+  if (!text || text.trim() === "(no output)") return null;
+  return text;
+}
+
+function mergeArtifact(current: ArtifactItem, patch: Partial<ArtifactItem>): ArtifactItem {
+  const merged = { ...current };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) {
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+  return merged;
+}
+
+function artifactSemanticallyEqual(a: ArtifactItem, b: ArtifactItem): boolean {
+  return a.id === b.id
+    && a.filePath === b.filePath
+    && a.fileName === b.fileName
+    && a.kind === b.kind
+    && a.status === b.status
+    && a.toolName === b.toolName
+    && a.toolCallId === b.toolCallId
+    && a.previewKind === b.previewKind
+    && a.beforeContent === b.beforeContent
+    && a.afterContent === b.afterContent
+    && a.language === b.language
+    && a.errorMessage === b.errorMessage;
+}
+
+function patchArtifactList(
+  prev: ArtifactItem[],
+  artifactId: string,
+  patch: Partial<ArtifactItem>,
+): ArtifactItem[] {
+  let changed = false;
+  const next = prev.map((item) => {
+    if (item.id !== artifactId) return item;
+    const merged = mergeArtifact(item, patch);
+    if (artifactSemanticallyEqual(item, merged)) return item;
+    changed = true;
+    return { ...merged, updatedAt: Date.now() };
+  });
+  return changed ? next : prev;
 }
 
 async function fetchTextFileContent(filePath: string): Promise<{ content: string; language?: string } | null> {
@@ -408,6 +491,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const artifactsRef = useRef<ArtifactItem[]>([]);
   const artifactBeforeFetchesRef = useRef<Set<string>>(new Set());
   const artifactAutoOpenRef = useRef<Set<string>>(new Set());
+  const artifactHydrationSignatureRef = useRef<string | null>(null);
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
 
@@ -784,6 +868,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     });
   }, []);
 
+  const clearQueuedStreamMessage = useCallback(() => {
+    pendingStreamMessageRef.current = null;
+    if (streamFrameRef.current !== null) {
+      cancelAnimationFrame(streamFrameRef.current);
+      streamFrameRef.current = null;
+    }
+  }, []);
+
   const upsertArtifact = useCallback((artifact: ArtifactItem, autoOpen: boolean) => {
     setArtifacts((prev) => {
       const index = prev.findIndex((item) => item.id === artifact.id);
@@ -791,7 +883,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return [artifact, ...prev].slice(0, 80);
       }
       const next = [...prev];
-      next[index] = { ...next[index], ...artifact, updatedAt: Date.now() };
+      const merged = mergeArtifact(next[index], artifact);
+      if (artifactSemanticallyEqual(next[index], merged)) return prev;
+      next[index] = { ...merged, updatedAt: Date.now() };
       return next;
     });
     if (autoOpen && !artifactAutoOpenRef.current.has(artifact.id)) {
@@ -800,69 +894,191 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [onArtifactOpenRequest]);
 
-  const captureArtifactBefore = useCallback((artifactId: string, filePath: string) => {
+  const captureArtifactBefore = useCallback((
+    artifactId: string,
+    filePath: string,
+    options: { upgradeCreated?: boolean; expectedAfterContent?: string } = {},
+  ) => {
     if (artifactBeforeFetchesRef.current.has(artifactId)) return;
     artifactBeforeFetchesRef.current.add(artifactId);
     void fetchTextFileContent(filePath).then((result) => {
       if (!result) return;
-      setArtifacts((prev) => prev.map((item) => (
-        item.id === artifactId
-          ? { ...item, beforeContent: result.content, language: result.language ?? item.language }
-          : item
-      )));
+      setArtifacts((prev) => patchArtifactList(prev, artifactId, {
+        beforeContent: options.expectedAfterContent === result.content ? undefined : result.content,
+        kind: options.upgradeCreated && options.expectedAfterContent !== result.content ? "modified" : undefined,
+        language: result.language,
+      }));
     });
   }, []);
 
-  const trackArtifactsFromMessage = useCallback((msg: Partial<AgentMessage>) => {
+  const trackArtifactsFromMessage = useCallback((
+    msg: Partial<AgentMessage>,
+    options: { autoOpen?: boolean; status?: ArtifactItem["status"] } = {},
+  ) => {
     if (msg.role !== "assistant") return;
     const content = (msg as Partial<AssistantMessage>).content ?? [];
     for (const block of content) {
       if (block.type !== "toolCall") continue;
       const call = block as ToolCallContent;
-      const kind = classifyArtifact(call.toolName, call.input ?? {});
-      if (!kind) continue;
+      const rawKind = classifyArtifact(call.toolName, call.input ?? {});
+      if (!isOutputArtifactKind(rawKind)) continue;
       const rawPath = readToolInputPath(call.input ?? {});
       if (!rawPath) continue;
       const filePath = resolveToolPath(rawPath, session?.cwd ?? newSessionCwd);
+      const previousForPath = artifactsRef.current.find((item) => (
+        item.filePath === filePath && isOutputArtifactKind(item.kind) && item.id !== call.toolCallId
+      ));
+      const kind: "created" | "modified" = rawKind === "created" && previousForPath ? "modified" : rawKind;
       const id = call.toolCallId || `${kind}:${filePath}:${call.toolName}`;
+      const inlineContent = readInlineArtifactContent(call.input ?? {});
+      const beforeContent = kind === "modified" ? previousForPath?.afterContent : undefined;
+      const afterContent = inlineContent ?? applyEditToContent(beforeContent, call.input ?? {});
       const artifact: ArtifactItem = {
         id,
         filePath,
         fileName: getFileName(filePath),
         kind,
-        status: artifactsRef.current.find((item) => item.id === id)?.status ?? "pending",
+        status: options.status ?? artifactsRef.current.find((item) => item.id === id)?.status ?? "pending",
         toolName: call.toolName,
         toolCallId: call.toolCallId,
+        beforeContent,
+        afterContent,
         updatedAt: Date.now(),
       };
-      upsertArtifact(artifact, kind === "created" || kind === "modified");
-      if (kind === "modified") captureArtifactBefore(id, filePath);
-      if (kind === "created" && typeof call.input.content === "string") {
-        setArtifacts((prev) => prev.map((item) => (
-          item.id === id
-            ? { ...item, afterContent: call.input.content as string, status: item.status }
-            : item
-        )));
+      upsertArtifact(artifact, options.autoOpen ?? (kind === "created" || kind === "modified"));
+      if (kind === "modified" && beforeContent === undefined) captureArtifactBefore(id, filePath);
+      if (rawKind === "created" && previousForPath === undefined) {
+        captureArtifactBefore(id, filePath, { upgradeCreated: true, expectedAfterContent: inlineContent });
+      }
+      if (options.status === "done" && (kind === "created" || kind === "modified")) {
+        void fetchTextFileContent(filePath).then((result) => {
+          if (!result) return;
+          setArtifacts((prev) => patchArtifactList(prev, id, {
+            afterContent: result.content,
+            language: result.language,
+          }));
+        });
       }
     }
   }, [captureArtifactBefore, newSessionCwd, session?.cwd, upsertArtifact]);
 
+  useEffect(() => {
+    if (agentRunning) return;
+
+    const root = session?.cwd ?? newSessionCwd;
+    const nextArtifacts: ArtifactItem[] = [];
+    const missingAfterContent: Array<{ id: string; filePath: string }> = [];
+    const pendingReadPaths = new Map<string, string>();
+    const latestContentByPath = new Map<string, string>();
+    const signatureParts = [session?.id ?? sessionIdRef.current ?? "new", root ?? ""];
+
+    for (const msg of messages) {
+      if (msg.role === "toolResult") {
+        const pathForRead = pendingReadPaths.get(msg.toolCallId);
+        const text = pathForRead ? readToolResultText(msg) : null;
+        if (pathForRead && text !== null) {
+          latestContentByPath.set(pathForRead, text);
+          signatureParts.push(["read-result", msg.toolCallId, pathForRead, text.length].join("\0"));
+        }
+        continue;
+      }
+
+      if (msg.role !== "assistant") continue;
+      const content = (msg as AssistantMessage).content ?? [];
+      for (const block of content) {
+        if (block.type !== "toolCall") continue;
+        const call = block as ToolCallContent;
+        const rawKind = classifyArtifact(call.toolName, call.input ?? {});
+        if (!rawKind) continue;
+        const rawPath = readToolInputPath(call.input ?? {});
+        if (!rawPath) continue;
+
+        const filePath = resolveToolPath(rawPath, root);
+        if (rawKind === "read") {
+          if (call.toolCallId) pendingReadPaths.set(call.toolCallId, filePath);
+          signatureParts.push(["read", call.toolCallId, filePath, call.toolName].join("\0"));
+          continue;
+        }
+        if (!isOutputArtifactKind(rawKind)) continue;
+
+        const priorContent = latestContentByPath.get(filePath);
+        const kind: "created" | "modified" = rawKind === "created" && priorContent !== undefined ? "modified" : rawKind;
+        const id = call.toolCallId || `${kind}:${filePath}:${call.toolName}`;
+        const existing = artifactsRef.current.find((item) => item.id === id);
+        const beforeContent = kind === "modified" ? (priorContent ?? existing?.beforeContent) : undefined;
+        const inlineContent = readInlineArtifactContent(call.input ?? {});
+        const afterContent = inlineContent
+          ?? applyEditToContent(beforeContent, call.input ?? {})
+          ?? existing?.afterContent;
+        const artifact: ArtifactItem = {
+          id,
+          filePath,
+          fileName: getFileName(filePath),
+          kind,
+          status: existing?.status === "error" ? "error" : "done",
+          toolName: call.toolName,
+          toolCallId: call.toolCallId,
+          beforeContent,
+          afterContent,
+          language: existing?.language,
+          errorMessage: existing?.errorMessage,
+          updatedAt: existing?.updatedAt ?? Date.now(),
+        };
+
+        signatureParts.push([
+          id,
+          kind,
+          filePath,
+          call.toolName,
+          beforeContent?.length ?? "",
+          afterContent?.length ?? "",
+        ].join("\0"));
+
+        const duplicateIndex = nextArtifacts.findIndex((item) => item.id === id);
+        if (duplicateIndex === -1) {
+          nextArtifacts.push(artifact);
+        } else {
+          nextArtifacts[duplicateIndex] = { ...nextArtifacts[duplicateIndex], ...artifact };
+        }
+
+        if (afterContent !== undefined) {
+          latestContentByPath.set(filePath, afterContent);
+        } else {
+          missingAfterContent.push({ id, filePath });
+        }
+      }
+    }
+
+    const signature = signatureParts.join("\n");
+    if (artifactHydrationSignatureRef.current === signature) return;
+    artifactHydrationSignatureRef.current = signature;
+    setArtifacts(nextArtifacts.reverse().slice(0, 80));
+
+    for (const pending of missingAfterContent) {
+      void fetchTextFileContent(pending.filePath).then((result) => {
+        if (!result) return;
+        setArtifacts((prev) => patchArtifactList(prev, pending.id, {
+          afterContent: result.content,
+          language: result.language,
+        }));
+      });
+    }
+  }, [agentRunning, messages, newSessionCwd, session?.cwd, session?.id]);
+
   const completeArtifact = useCallback((toolCallId: string, isError?: boolean, errorMessage?: string) => {
     const current = artifactsRef.current.find((item) => item.toolCallId === toolCallId || item.id === toolCallId);
     if (!current) return;
-    setArtifacts((prev) => prev.map((item) => (
-      item.id === current.id
-        ? { ...item, status: isError ? "error" : "done", errorMessage, updatedAt: Date.now() }
-        : item
-    )));
+    setArtifacts((prev) => patchArtifactList(prev, current.id, {
+      status: isError ? "error" : "done",
+      errorMessage,
+    }));
     if (!isError && (current.kind === "created" || current.kind === "modified")) {
       void fetchTextFileContent(current.filePath).then((result) => {
         if (!result) return;
-        setArtifacts((prev) => prev.map((item) => (
-          item.id === current.id
-            ? { ...item, afterContent: result.content, language: result.language ?? item.language, updatedAt: Date.now() }
-            : item
-        )));
+        setArtifacts((prev) => patchArtifactList(prev, current.id, {
+          afterContent: result.content,
+          language: result.language,
+        }));
       });
     }
   }, []);
@@ -920,6 +1136,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (runId !== undefined && promptRunIdRef.current !== runId) return;
       if (!agentRunningRef.current) return;
+      clearQueuedStreamMessage();
       agentRunningRef.current = false;
       setAgentRunning(false);
       setAgentPhase(null);
@@ -927,7 +1144,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       dispatch({ type: "end" });
       onAgentEnd?.();
     }
-  }, [activeLeafId, loadContext, loadSession, onAgentEnd]);
+  }, [activeLeafId, clearQueuedStreamMessage, loadContext, loadSession, onAgentEnd]);
 
   const waitForPromptSettlement = useCallback(async (sid: string, runId?: number) => {
     await delay(PROMPT_SETTLE_INITIAL_DELAY_MS);
@@ -987,6 +1204,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         dispatch({ type: "start" });
         break;
       case "agent_end":
+        clearQueuedStreamMessage();
         agentRunningRef.current = false;
         setAgentRunning(false);
         setAgentPhase(null);
@@ -1032,11 +1250,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "message_end": {
+        clearQueuedStreamMessage();
         const completed = event.message as AgentMessage | undefined;
         if (completed && completed.role !== "user") {
           const normalized = normalizeToolCalls(completed);
           trackArtifactsFromMessage(normalized);
-          setMessages((prev) => [...prev, normalized]);
+          setMessages((prev) => {
+            const currentSignature = assistantContentSignature(normalized);
+            const previousSignature = prev.length ? assistantContentSignature(prev[prev.length - 1]) : null;
+            if (currentSignature && currentSignature === previousSignature) return prev;
+            return [...prev, normalized];
+          });
         }
         dispatch({ type: "reset" });
         setAgentPhase({ kind: "waiting_model" });
@@ -1096,7 +1320,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
     }
-  }, [activeLeafId, addNotice, completeArtifact, finishPromptWithoutStream, handleExtensionUiRequest, loadContext, loadSession, onAgentEnd, queueStreamMessage, trackArtifactsFromMessage]);
+  }, [activeLeafId, addNotice, clearQueuedStreamMessage, completeArtifact, finishPromptWithoutStream, handleExtensionUiRequest, loadContext, loadSession, onAgentEnd, queueStreamMessage, trackArtifactsFromMessage]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {

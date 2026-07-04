@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { basename, dirname, join } from "path";
 import { promisify } from "util";
-import { fileURLToPath, pathToFileURL } from "url";
+import { fileURLToPath } from "url";
 import { NextResponse } from "next/server";
 import { resolveSessionPath } from "@/lib/session-reader";
 
@@ -14,10 +14,6 @@ export const runtime = "nodejs";
 
 type PiCodingAgentModule = {
   getPackageDir: () => string;
-};
-
-type ExportHtmlModule = {
-  exportFromFile: (inputPath: string, outputPath: string) => Promise<string>;
 };
 
 async function getPiPackageDir(): Promise<string | null> {
@@ -96,9 +92,29 @@ async function exportSession(filePath: string, outputPath: string): Promise<void
   const packageDir = await getPiPackageDir();
   if (!packageDir) throw new Error("pi CLI not found");
 
-  const exporterUrl = pathToFileURL(join(packageDir, "dist", "core", "export-html", "index.js")).href;
-  const { exportFromFile } = (await import(exporterUrl)) as ExportHtmlModule;
-  await exportFromFile(filePath, outputPath);
+  const exporterPath = join(packageDir, "dist", "core", "export-html", "index.js");
+  if (!existsSync(exporterPath)) throw new Error("pi HTML exporter not found");
+
+  const exporterScript = `
+const { pathToFileURL } = require("url");
+(async () => {
+  const exporter = await import(pathToFileURL(process.argv[1]).href);
+  await exporter.exportFromFile(process.argv[2], process.argv[3]);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+`;
+  await execFileAsync(process.execPath, ["-e", exporterScript, exporterPath, filePath, outputPath], {
+    cwd: process.cwd(),
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      PI_OFFLINE: "1",
+      PI_SKIP_VERSION_CHECK: "1",
+    },
+    maxBuffer: 1024 * 1024,
+  });
 }
 
 export async function GET(

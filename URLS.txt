@@ -1,17 +1,22 @@
-pi-web Multi-Instance URLs
-==========================
+pi-web daily URL
+================
 
-Daily use:
 http://localhost:30142
 
-Parallel tasks:
-http://localhost:30142
-http://localhost:30143
-http://localhost:30144
-http://localhost:30145
-http://localhost:30146
+One-click startup
+=================
 
-How to use:
-1. Double-click start-30142.bat for daily use
-2. Double-click other .bat files for parallel tasks
-3. Close command window to stop instance
+Double-click:
+C:\Users\彭宏宣\pi-web\启动脚本\一键启动 pi-web 30142.bat
+
+Use it when http://localhost:30142 cannot open.
+
+Notes
+=====
+
+- The script starts pi-web as a background service process.
+- Closing the startup window will not stop the website.
+- Runtime logs are stored in:
+  C:\Users\彭宏宣\pi-web\启动脚本\logs
+- Old startup scripts were moved to:
+  C:\Users\彭宏宣\pi-web\启动脚本\old-startup-scripts-20260704

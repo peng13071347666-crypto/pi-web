@@ -40,3 +40,7 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .factory
+
+# local startup runtime files
+/启动脚本/logs/
+/启动脚本/state/

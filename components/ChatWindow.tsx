@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentMessage, ArtifactItem, ExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
+import type { OpenPathAction } from "./ArtifactCards";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { useAgentSession, type AgentPhase, type NoticeItem } from "@/hooks/useAgentSession";
 import { useAudio } from "@/hooks/useAudio";
@@ -25,6 +26,10 @@ interface Props {
   onContextUsageChange?: (usage: { percent: number | null; contextWindow: number; tokens: number | null } | null) => void;
   onArtifactsChange?: (artifacts: ArtifactItem[]) => void;
   onArtifactOpenRequest?: (filePath: string) => void;
+  onArtifactPreviewRequest?: (artifactId: string) => void;
+  onReviewArtifactsRequest?: (artifactIds: string[]) => void;
+  onFilePreviewRequest?: (filePath: string) => void;
+  onOpenPathRequest?: (filePath: string, action: OpenPathAction) => void;
 }
 
 function phaseLabel(phase: AgentPhase): string {
@@ -99,7 +104,7 @@ function Typewriter({ phrases }: { phrases: string[] }) {
   );
 }
 
-export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onArtifactsChange, onArtifactOpenRequest }: Props) {
+export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onArtifactsChange, onArtifactOpenRequest, onArtifactPreviewRequest, onReviewArtifactsRequest, onFilePreviewRequest, onOpenPathRequest }: Props) {
   const {
     loading, error, messages, entryIds, streamState,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
@@ -109,7 +114,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     notices, extensionDialog, extensionStatuses, extensionWidgets, respondToExtensionUi,
     isAutoModelSelection,
     agentPhase,
-    hasMoreBefore, loadingMoreContext,
+    hasMoreBefore, loadingMoreContext, artifacts,
     isNew,
     messagesEndRef, scrollContainerRef,
     lastUserMsgRef,
@@ -405,7 +410,10 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                   for (let j = idx + 1; j < messages.length; j++) {
                     const r = messages[j].role;
                     if (r === "user") break;
-                    if (r === "assistant") { showTimestamp = false; break; }
+                    if (r === "assistant") {
+                      showTimestamp = false;
+                      break;
+                    }
                   }
                   // Hide on the currently-streaming tail (the streaming bubble owns the live timestamp)
                   if (showTimestamp && streamState.isStreaming && idx === messages.length - 1) {
@@ -426,6 +434,12 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     onEditContent={(content) => chatInputRef?.current?.insertIfEmpty(content)}
                     showTimestamp={showTimestamp}
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as import("@/lib/types").AgentMessage & { timestamp?: number }).timestamp : undefined}
+                    artifacts={artifacts}
+                    cwd={session?.cwd ?? newSessionCwd ?? undefined}
+                    onPreviewArtifact={onArtifactPreviewRequest}
+                    onReviewArtifacts={onReviewArtifactsRequest}
+                    onPreviewFile={onFilePreviewRequest}
+                    onOpenPath={onOpenPathRequest}
                   />
                 );
                 if (!isVisible) return view;
@@ -441,7 +455,17 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
             })()}
 
             {streamState.isStreaming && streamState.streamingMessage && (
-              <MessageView message={streamState.streamingMessage as AgentMessage} isStreaming modelNames={modelNames} />
+              <MessageView
+                message={streamState.streamingMessage as AgentMessage}
+                isStreaming
+                modelNames={modelNames}
+                artifacts={artifacts}
+                cwd={session?.cwd ?? newSessionCwd ?? undefined}
+                onPreviewArtifact={onArtifactPreviewRequest}
+                onReviewArtifacts={onReviewArtifactsRequest}
+                onPreviewFile={onFilePreviewRequest}
+                onOpenPath={onOpenPathRequest}
+              />
             )}
 
             {agentRunning && !streamState.streamingMessage && (

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import {
@@ -208,6 +209,45 @@ function streamFile(filePath: string, stat: fs.Stats, contentType: string, range
       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
     },
   });
+}
+
+function launchDetached(command: string, args: string[], windowsHide = true): void {
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide,
+  });
+  child.unref();
+}
+
+function normalizeWindowsPath(filePath: string): string {
+  return path.win32.normalize(filePath.replace(/\//g, "\\"));
+}
+
+function openPathWithSystem(filePath: string): void {
+  if (process.platform === "win32") {
+    launchDetached("cmd.exe", ["/c", "start", "", filePath]);
+    return;
+  }
+  if (process.platform === "darwin") {
+    launchDetached("open", [filePath]);
+    return;
+  }
+  launchDetached("xdg-open", [filePath]);
+}
+
+function openFolderWithSystem(filePath: string, stat: fs.Stats): void {
+  const folderPath = stat.isDirectory() ? filePath : path.dirname(filePath);
+  if (process.platform === "win32") {
+    const target = normalizeWindowsPath(stat.isDirectory() ? folderPath : filePath);
+    launchDetached("explorer.exe", [stat.isDirectory() ? target : `/select,${target}`], false);
+    return;
+  }
+  if (process.platform === "darwin") {
+    launchDetached("open", [folderPath]);
+    return;
+  }
+  launchDetached("xdg-open", [folderPath]);
 }
 
 function documentPreviewKind(filePath: string): "pdf" | "docx" | null {
@@ -447,6 +487,47 @@ export async function GET(
       });
 
     return NextResponse.json({ entries, path: filePath });
+  } catch (error) {
+    return NextResponse.json({ error: String(error) }, { status: 500 });
+  }
+}
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> }
+) {
+  try {
+    const { path: segments } = await params;
+    const filePath = filePathFromSegments(segments);
+    const body = await request.json().catch(() => ({})) as { action?: string };
+    const action = body.action;
+
+    if (action !== "open" && action !== "openFolder") {
+      return NextResponse.json({ error: "Unsupported action" }, { status: 400 });
+    }
+
+    const allowedRoots = await getAllowedFileRoots();
+    if (!isFilePathAllowed(filePath, allowedRoots)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    if (action === "open") {
+      if (!stat.isFile() && !stat.isDirectory()) {
+        return NextResponse.json({ error: "Not a file or directory" }, { status: 400 });
+      }
+      openPathWithSystem(filePath);
+      return NextResponse.json({ ok: true });
+    }
+
+    openFolderWithSystem(filePath, stat);
+    return NextResponse.json({ ok: true });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

@@ -2,8 +2,10 @@
 
 import { useState, useRef, useEffect, useMemo } from "react";
 import { MarkdownBody } from "./MarkdownBody";
+import { ArtifactCards, AttachedFileCards, type OpenPathAction } from "./ArtifactCards";
 import type {
   AgentMessage,
+  ArtifactItem,
   UserMessage,
   AssistantMessage,
   CustomMessage,
@@ -28,6 +30,12 @@ interface Props {
   onEditContent?: (content: string) => void;
   showTimestamp?: boolean;
   prevTimestamp?: number;
+  artifacts?: ArtifactItem[];
+  cwd?: string;
+  onPreviewArtifact?: (artifactId: string) => void;
+  onReviewArtifacts?: (artifactIds: string[]) => void;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
 }
 
 function formatTime(ts?: number): string | null {
@@ -62,12 +70,59 @@ function copyText(text: string): Promise<void> {
   }
 }
 
-export function MessageView({ message, isStreaming, toolResults, modelNames, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp }: Props) {
+export function MessageView({
+  message,
+  isStreaming,
+  toolResults,
+  modelNames,
+  entryId,
+  onFork,
+  forking,
+  onNavigate,
+  prevAssistantEntryId,
+  onEditContent,
+  showTimestamp,
+  prevTimestamp,
+  artifacts,
+  cwd,
+  onPreviewArtifact,
+  onReviewArtifacts,
+  onPreviewFile,
+  onOpenPath,
+}: Props) {
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
+    return (
+      <UserMessageView
+        message={message as UserMessage}
+        entryId={entryId}
+        onFork={onFork}
+        forking={forking}
+        onNavigate={onNavigate}
+        prevAssistantEntryId={prevAssistantEntryId}
+        onEditContent={onEditContent}
+        cwd={cwd}
+        onPreviewFile={onPreviewFile}
+        onOpenPath={onOpenPath}
+      />
+    );
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} />;
+    return (
+      <AssistantMessageView
+        message={message as AssistantMessage}
+        isStreaming={isStreaming}
+        toolResults={toolResults}
+        modelNames={modelNames}
+        showTimestamp={showTimestamp}
+        prevTimestamp={prevTimestamp}
+        artifacts={artifacts}
+        cwd={cwd}
+        onPreviewArtifact={onPreviewArtifact}
+        onReviewArtifacts={onReviewArtifacts}
+        onPreviewFile={onPreviewFile}
+        onOpenPath={onOpenPath}
+      />
+    );
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -79,7 +134,66 @@ export function MessageView({ message, isStreaming, toolResults, modelNames, ent
   return null;
 }
 
-function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent }: {
+function decodeFileAttr(value: string): string {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function extractFileRefs(text: string): { text: string; files: string[] } {
+  const files: string[] = [];
+  const cleaned = text.replace(/<file\b([^>]*)>([\s\S]*?)<\/file>|<file\b([^>]*)\/>/gi, (_match, openAttrs: string | undefined, _body: string | undefined, selfAttrs: string | undefined) => {
+    const attrs = openAttrs ?? selfAttrs ?? "";
+    const nameMatch = attrs.match(/\bname\s*=\s*(["'])(.*?)\1/i);
+    if (nameMatch?.[2]) files.push(decodeFileAttr(nameMatch[2]));
+    return "";
+  });
+  return {
+    text: cleaned.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim(),
+    files: [...new Set(files)],
+  };
+}
+
+function normalizeStandalonePathLine(line: string): string | null {
+  let value = line.trim();
+  if (!value) return null;
+  value = value.replace(/^[*-]\s+/, "").trim();
+  const backtick = value.match(/^`([^`]+)`$/);
+  if (backtick) value = backtick[1].trim();
+  const quote = value.match(/^["'](.+)["']$/);
+  if (quote) value = quote[1].trim();
+  if (/^[a-zA-Z]:[\\/].+/.test(value)) return value;
+  if (/^\\\\[^\\]+\\[^\\]+/.test(value)) return value;
+  if (/^\/[^/\s]+(?:\/[^/\s]+)+/.test(value)) return value;
+  return null;
+}
+
+function extractStandaloneFilePaths(text: string, hiddenFilePaths?: Set<string>): { text: string; files: string[] } {
+  const files: string[] = [];
+  const lines = text.split("\n");
+  let inFence = false;
+  const kept = lines.filter((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return true;
+    }
+    if (inFence) return true;
+    const filePath = normalizeStandalonePathLine(line);
+    if (!filePath) return true;
+    if (hiddenFilePaths?.has(filePath)) return false;
+    files.push(filePath);
+    return false;
+  });
+  return {
+    text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    files: [...new Set(files)],
+  };
+}
+
+function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, cwd, onPreviewFile, onOpenPath }: {
   message: UserMessage;
   entryId?: string;
   onFork?: (entryId: string) => void;
@@ -87,17 +201,23 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
   onNavigate?: (entryId: string) => void;
   prevAssistantEntryId?: string;
   onEditContent?: (content: string) => void;
+  cwd?: string;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const content =
+  const rawContent =
     typeof message.content === "string"
       ? message.content
       : message.content
           .filter((b): b is TextContent => b.type === "text")
           .map((b) => b.text)
           .join("\n");
+  const parsedContent = useMemo(() => extractFileRefs(rawContent), [rawContent]);
+  const content = parsedContent.text;
+  const attachedFilePaths = parsedContent.files;
 
   const imageBlocks: ImageContent[] =
     typeof message.content === "string"
@@ -160,6 +280,12 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
             </div>
           )}
           {content && <MarkdownBody className="markdown-user-message">{content}</MarkdownBody>}
+          <AttachedFileCards
+            files={attachedFilePaths}
+            cwd={cwd}
+            onPreviewFile={onPreviewFile}
+            onOpenPath={onOpenPath}
+          />
         </div>
 
       </div>
@@ -282,6 +408,12 @@ function AssistantMessageView({
   modelNames,
   showTimestamp,
   prevTimestamp,
+  artifacts,
+  cwd,
+  onPreviewArtifact,
+  onReviewArtifacts,
+  onPreviewFile,
+  onOpenPath,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
@@ -289,9 +421,15 @@ function AssistantMessageView({
   modelNames?: Record<string, string>;
   showTimestamp?: boolean;
   prevTimestamp?: number;
+  artifacts?: ArtifactItem[];
+  cwd?: string;
+  onPreviewArtifact?: (artifactId: string) => void;
+  onReviewArtifacts?: (artifactIds: string[]) => void;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
 }) {
   const time = showTimestamp ? formatTime(message.timestamp) : null;
-  const blocks = message.content ?? [];
+  const blocks = useMemo(() => message.content ?? [], [message.content]);
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
   const streamStartRef = useRef<number | null>(null);
@@ -330,6 +468,20 @@ function AssistantMessageView({
     .filter((b): b is TextContent => b.type === "text")
     .map((b) => b.text)
     .join("\n");
+
+  const messageArtifacts = useMemo(() => {
+    if (!artifacts?.length) return [];
+    const callIds = new Set(
+      blocks
+        .filter((block): block is ToolCallContent => block.type === "toolCall")
+        .flatMap((block) => [block.toolCallId, block.toolCallId || ""])
+        .filter(Boolean)
+    );
+    if (callIds.size === 0) return [];
+    return artifacts.filter((artifact) => (
+      (artifact.toolCallId && callIds.has(artifact.toolCallId)) || callIds.has(artifact.id)
+    ));
+  }, [artifacts, blocks]);
 
   const copyContent = () => {
     copyText(textContent).then(() => {
@@ -448,8 +600,28 @@ function AssistantMessageView({
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {blocks.map((block, i) => (
-          <BlockView key={i} block={block} toolResults={toolResults} isStreaming={isStreaming} streamingDuration={streamingDurations.get(i) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)} toolCallDurations={toolCallDurations} />
+          <BlockView
+            key={i}
+            block={block}
+            toolResults={toolResults}
+            isStreaming={isStreaming}
+            streamingDuration={streamingDurations.get(i) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
+            toolCallDurations={toolCallDurations}
+            hiddenFilePaths={new Set(messageArtifacts.map((artifact) => artifact.filePath))}
+            cwd={cwd}
+            onPreviewFile={onPreviewFile}
+            onOpenPath={onOpenPath}
+          />
         ))}
+        {!isStreaming && (
+          <ArtifactCards
+            artifacts={messageArtifacts}
+            cwd={cwd}
+            onPreviewArtifact={onPreviewArtifact}
+            onReviewArtifacts={onReviewArtifacts}
+            onOpenPath={onOpenPath}
+          />
+        )}
       </div>
 
       <div style={{
@@ -501,9 +673,38 @@ function AssistantMessageView({
   );
 }
 
-function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCallDurations }: { block: AssistantContentBlock; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number> }) {
+function BlockView({
+  block,
+  toolResults,
+  isStreaming,
+  streamingDuration,
+  toolCallDurations,
+  hiddenFilePaths,
+  cwd,
+  onPreviewFile,
+  onOpenPath,
+}: {
+  block: AssistantContentBlock;
+  toolResults?: Map<string, ToolResultMessage>;
+  isStreaming?: boolean;
+  streamingDuration?: number;
+  toolCallDurations?: Map<string, number>;
+  hiddenFilePaths?: Set<string>;
+  cwd?: string;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
+}) {
   if (block.type === "text") {
-    return <TextBlock block={block as TextContent} isStreaming={isStreaming} />;
+    return (
+      <TextBlock
+        block={block as TextContent}
+        isStreaming={isStreaming}
+        hiddenFilePaths={hiddenFilePaths}
+        cwd={cwd}
+        onPreviewFile={onPreviewFile}
+        onOpenPath={onOpenPath}
+      />
+    );
   }
   if (block.type === "thinking") {
     return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} />;
@@ -517,8 +718,36 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
   return null;
 }
 
-function TextBlock({ block, isStreaming }: { block: TextContent; isStreaming?: boolean }) {
-  return <MarkdownBody isStreaming={isStreaming}>{block.text}</MarkdownBody>;
+function TextBlock({
+  block,
+  isStreaming,
+  hiddenFilePaths,
+  cwd,
+  onPreviewFile,
+  onOpenPath,
+}: {
+  block: TextContent;
+  isStreaming?: boolean;
+  hiddenFilePaths?: Set<string>;
+  cwd?: string;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
+}) {
+  const parsed = useMemo(() => extractStandaloneFilePaths(block.text, hiddenFilePaths), [block.text, hiddenFilePaths]);
+  return (
+    <>
+      {parsed.text && <MarkdownBody isStreaming={isStreaming}>{parsed.text}</MarkdownBody>}
+      {!isStreaming && (
+        <AttachedFileCards
+          files={parsed.files}
+          cwd={cwd}
+          caption="File output"
+          onPreviewFile={onPreviewFile}
+          onOpenPath={onOpenPath}
+        />
+      )}
+    </>
+  );
 }
 
 function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?: number }) {

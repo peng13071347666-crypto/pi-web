@@ -1,14 +1,17 @@
 "use client";
 
+import { useState } from "react";
 import type { ArtifactItem } from "@/lib/types";
 import { getRelativeFilePath } from "@/lib/file-paths";
 import { DiffView, FileViewer } from "./FileViewer";
+import { OpenMenu, type OpenPathAction } from "./ArtifactCards";
 
 interface Props {
   artifacts: ArtifactItem[];
   activeArtifactId: string | null;
   cwd?: string;
   onSelectArtifact: (id: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
 }
 
 function kindLabel(kind: ArtifactItem["kind"]): string {
@@ -24,10 +27,12 @@ function statusColor(status: ArtifactItem["status"]): string {
   return "var(--text-dim)";
 }
 
-export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtifact }: Props) {
-  const active = artifacts.find((item) => item.id === activeArtifactId) ?? artifacts[0] ?? null;
+export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtifact, onOpenPath }: Props) {
+  const outputArtifacts = artifacts.filter((item) => item.kind === "created" || item.kind === "modified");
+  const active = outputArtifacts.find((item) => item.id === activeArtifactId) ?? outputArtifacts[0] ?? null;
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
 
-  if (artifacts.length === 0) {
+  if (outputArtifacts.length === 0) {
     return (
       <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>
         No artifacts yet
@@ -36,9 +41,9 @@ export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtif
   }
 
   return (
-    <div style={{ height: "100%", display: "grid", gridTemplateColumns: "220px minmax(0, 1fr)", minWidth: 0 }}>
+    <div style={{ width: "100%", height: "100%", display: "grid", gridTemplateColumns: "220px minmax(0, 1fr)", minWidth: 0 }}>
       <div style={{ borderRight: "1px solid var(--border)", overflowY: "auto", background: "var(--bg-panel)" }}>
-        {artifacts.map((item) => {
+        {outputArtifacts.map((item) => {
           const selected = active?.id === item.id;
           return (
             <button
@@ -78,7 +83,7 @@ export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtif
         })}
       </div>
 
-      <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+      <div style={{ width: "100%", minWidth: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         {active ? (
           <>
             <div style={{
@@ -98,14 +103,26 @@ export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtif
               <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text-muted)" }}>
                 {getRelativeFilePath(active.filePath, cwd)}
               </span>
+              <OpenMenu
+                id={`artifact-panel:${active.id}`}
+                filePath={active.filePath}
+                openId={openMenuId}
+                onToggle={(id) => setOpenMenuId((current) => current === id ? null : id)}
+                onClose={() => setOpenMenuId(null)}
+                onOpenPath={onOpenPath}
+              />
             </div>
-            <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+            <div style={{ flex: 1, width: "100%", minWidth: 0, minHeight: 0, overflow: "hidden" }}>
               {active.errorMessage ? (
                 <div style={{ padding: 12, color: "#ef4444", fontSize: 12, fontFamily: "var(--font-mono)", whiteSpace: "pre-wrap" }}>
                   {active.errorMessage}
                 </div>
+              ) : active.status === "pending" ? (
+                <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>
+                  Waiting for file output...
+                </div>
               ) : active.beforeContent !== undefined && active.afterContent !== undefined ? (
-                <div style={{ height: "100%", overflow: "auto" }}>
+                <div style={{ width: "100%", height: "100%", overflow: "auto" }}>
                   <DiffView oldContent={active.beforeContent} newContent={active.afterContent} language={active.language ?? "text"} />
                 </div>
               ) : (

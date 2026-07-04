@@ -24,6 +24,11 @@ const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "
 const AUDIO_EXTS = new Set(["mp3", "wav", "ogg", "oga", "opus", "m4a", "aac", "flac", "weba", "webm"]);
 const DOCUMENT_PREVIEW_EXTS = new Set(["pdf", "docx"]);
 const DOCX_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+const FILE_PREVIEW_RETRY_LIMIT = 10;
+
+function isRetryablePreviewError(message: string): boolean {
+  return /not found|failed to fetch|networkerror/i.test(message);
+}
 
 function isImagePath(filePath: string): boolean {
   const base = getFileName(filePath);
@@ -206,13 +211,16 @@ export function DiffView({ oldContent, newContent }: { oldContent: string; newCo
   let diffIdx = 0;
 
   return (
-    <div style={{ fontFamily: "var(--font-mono)", fontSize: 13, lineHeight: 1.6 }}>
+    <div style={{ width: "100%", minWidth: 0, overflowX: "auto", fontFamily: "var(--font-mono)", fontSize: 13, lineHeight: 1.6 }}>
       {segments.map((seg, si) => {
         if (seg.hidden) {
           const result = (
             <div
               key={si}
               style={{
+                width: "100%",
+                minWidth: "max-content",
+                boxSizing: "border-box",
                 padding: "2px 16px",
                 color: "var(--text-dim)",
                 background: "var(--bg-panel)",
@@ -246,6 +254,9 @@ export function DiffView({ oldContent, newContent }: { oldContent: string; newCo
               key={li}
               style={{
                 display: "flex",
+                width: "100%",
+                minWidth: "max-content",
+                boxSizing: "border-box",
                 background: bg,
                 borderLeft: line.type === "added"
                   ? "3px solid #4ade80"
@@ -285,10 +296,10 @@ export function DiffView({ oldContent, newContent }: { oldContent: string; newCo
               <span
                 style={{
                   flex: 1,
+                  minWidth: 0,
                   padding: "0 8px 0 0",
                   whiteSpace: "pre",
                   color: "var(--text)",
-                  overflowX: "auto",
                 }}
               >
                 {line.text || "\u00a0"}
@@ -297,7 +308,7 @@ export function DiffView({ oldContent, newContent }: { oldContent: string; newCo
           );
         });
         diffIdx += seg.lines.length;
-        return <div key={si}>{lines}</div>;
+        return <div key={si} style={{ width: "100%", minWidth: 0 }}>{lines}</div>;
       })}
     </div>
   );
@@ -702,14 +713,13 @@ function TextFileViewer({ filePath, cwd }: Props) {
   const [changeCount, setChangeCount] = useState(0);
   const esRef = useRef<EventSource | null>(null);
 
-  const fetchContent = useCallback((filePath: string, isRefresh = false) => {
+  const fetchContent = useCallback((filePath: string, isRefresh = false, attempt = 0): Promise<FileData | null> => {
     const encoded = encodeFilePathForApi(filePath);
     return fetch(`/api/files/${encoded}?type=read`)
       .then((r) => r.json())
       .then((d: FileData & { error?: string }) => {
         if (d.error) {
-          setError(d.error);
-          return null;
+          throw new Error(d.error);
         }
         if (isRefresh) {
           setData((prev) => {
@@ -723,7 +733,16 @@ function TextFileViewer({ filePath, cwd }: Props) {
         return d;
       })
       .catch((e) => {
-        setError(String(e));
+        const message = e instanceof Error ? e.message : String(e);
+        if (attempt < FILE_PREVIEW_RETRY_LIMIT && isRetryablePreviewError(message)) {
+          const retryDelay = Math.min(250 + attempt * 250, 1500);
+          return new Promise<FileData | null>((resolve) => {
+            window.setTimeout(() => {
+              void fetchContent(filePath, isRefresh, attempt + 1).then(resolve);
+            }, retryDelay);
+          });
+        }
+        setError(message);
         return null;
       });
   }, []);
@@ -956,7 +975,12 @@ function TextFileViewer({ filePath, cwd }: Props) {
         ) : isMarkdown && previewMode ? (
           <div
             className="markdown-body markdown-file-preview"
-            style={{ padding: "24px 32px", maxWidth: 800 }}
+            style={{
+              boxSizing: "border-box",
+              width: "100%",
+              maxWidth: "none",
+              padding: "24px clamp(20px, 4vw, 48px)",
+            }}
           >
             <ReactMarkdown
               remarkPlugins={markdownPreviewRemarkPlugins}
