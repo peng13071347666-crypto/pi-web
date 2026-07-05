@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* eslint-disable @typescript-eslint/no-require-imports */
 /**
  * Applies the pi-multimodal-proxy Unicode provider fix to the global pi agent's
  * node_modules. This is needed because pi-web runs agent sessions in-process,

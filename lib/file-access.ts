@@ -4,7 +4,7 @@ import path from "path";
 import { listAllSessions } from "./session-reader";
 
 // Short-TTL cache for the allowed-roots set. Without this, every file list/read
-// request re-scans every pi session on disk just to check access. 5s is short
+// request re-scans every pi session on disk just to check access. 30s is short
 // enough that newly-created cwds appear promptly; stored on globalThis so it
 // survives Next.js hot-reload.
 declare global {
@@ -12,7 +12,7 @@ declare global {
   var __piAdditionalAllowedRoots: Set<string> | undefined;
 }
 
-const ALLOWED_ROOTS_TTL_MS = 5_000;
+const ALLOWED_ROOTS_TTL_MS = 30_000;
 const WINDOWS_ABSOLUTE_RE = /^[a-zA-Z]:[\\/]/;
 
 export function normalizeSlashes(filePath: string): string {

@@ -140,9 +140,25 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
   const remediation: string[] = [];
   let status: "ok" | "warning" | "error" = "ok";
 
+  // Missing local dependencies should be surfaced directly instead of being
+  // misdiagnosed as a version mismatch.
+  if (bundledPiVersion === "unknown" || bundledPiAiVersion === "unknown") {
+    status = "warning";
+    messages.push(
+      "pi-web 未检测到完整的本地依赖版本信息。通常是当前项目尚未执行 npm install / npm ci，或 node_modules 不完整。",
+    );
+    remediation.push(
+      "在 pi-web 根目录运行 “npm ci” 或 “npm install”，然后重启 pi-web 服务。",
+    );
+  }
+
   // 1. Bundled pi-coding-agent older than the data dir → the most dangerous case.
   //    pi-web's parsers/readers are reading files written by a newer pi CLI.
-  if (dataDirVersion && compareVersions(bundledPiVersion, dataDirVersion) < 0) {
+  if (
+    bundledPiVersion !== "unknown" &&
+    dataDirVersion &&
+    compareVersions(bundledPiVersion, dataDirVersion) < 0
+  ) {
     status = "error";
     messages.push(
       `pi-web 内置 pi-coding-agent ${bundledPiVersion} 低于数据目录版本 ${dataDirVersion}（~/.pi/agent 由新版 pi CLI 写入）。` +
@@ -157,6 +173,7 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
 
   // 2. Global pi CLI newer than bundled → CLI 会写入 pi-web 读不懂的新格式
   if (
+    bundledPiVersion !== "unknown" &&
     globalPiVersion &&
     compareVersions(bundledPiVersion, globalPiVersion) < 0
   ) {
@@ -174,6 +191,7 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
 
   // 3. Global pi CLI older than bundled → pi-web 写入的数据旧 CLI 读不懂
   if (
+    bundledPiVersion !== "unknown" &&
     globalPiVersion &&
     compareVersions(bundledPiVersion, globalPiVersion) > 0
   ) {

@@ -24,7 +24,7 @@ const TEXT_EXTS = new Set([
 ]);
 
 function sanitizeFileName(name: string): string {
-  const trimmed = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim();
+  const trimmed = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, "_").trim();
   return trimmed.slice(0, 160) || "attachment";
 }
 

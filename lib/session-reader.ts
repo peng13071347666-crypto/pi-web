@@ -7,6 +7,9 @@ import { normalizeToolCalls } from "./normalize";
 
 export { getAgentDir };
 
+const SESSION_LIST_FIRST_MESSAGE_MAX_CHARS = 200;
+const IMAGE_FILE_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|avif|heic|heif|tiff?)$/i;
+
 export function getSessionsDir(): string {
   return `${getAgentDir()}/sessions`;
 }
@@ -66,6 +69,44 @@ function getMessageText(content: unknown): string {
     .join("\n");
 }
 
+function truncateSessionPreview(text: string): string {
+  if (text.length <= SESSION_LIST_FIRST_MESSAGE_MAX_CHARS) return text;
+  return `${text.slice(0, SESSION_LIST_FIRST_MESSAGE_MAX_CHARS).trimEnd()}...`;
+}
+
+function decodeFileAttr(value: string): string {
+  return value
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function cleanSessionPreviewText(text: string): string {
+  const fileRefs: string[] = [];
+  const cleaned = text.replace(/<file\b([^>]*)>([\s\S]*?)<\/file>|<file\b([^>]*)\/>/gi, (_match, openAttrs: string | undefined, _body: string | undefined, selfAttrs: string | undefined) => {
+    const attrs = openAttrs ?? selfAttrs ?? "";
+    const nameMatch = attrs.match(/\bname\s*=\s*(["'])(.*?)\1/i);
+    if (nameMatch?.[2]) fileRefs.push(decodeFileAttr(nameMatch[2]));
+    return "";
+  }).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  if (cleaned) return cleaned;
+  if (fileRefs.some(isInternalImageAttachment)) {
+    return fileRefs.length === 1 ? "Image attached" : `${fileRefs.length} images attached`;
+  }
+  return text.trim();
+}
+
+function isInternalImageAttachment(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  if (!IMAGE_FILE_EXT_RE.test(normalized)) return false;
+  return /\/\.pi\/agent\/web-attachments\//.test(normalized)
+    || /\/var\/folders\/[^/]+\/[^/]+\/T\/codex-clipboard-[^/]+$/i.test(normalized)
+    || /^\/tmp\/codex-clipboard-[^/]+$/i.test(normalized);
+}
+
 function parseSessionFileForIndex(filePath: string, size: number, mtimeMs: number): CachedSessionRecord | null {
   let content: string;
   try {
@@ -101,7 +142,7 @@ function parseSessionFileForIndex(filePath: string, size: number, mtimeMs: numbe
     if (entry.type === "message") {
       messageCount += 1;
       if (!firstMessage && entry.message?.role === "user") {
-        firstMessage = getMessageText((entry.message as UserMessage).content);
+        firstMessage = truncateSessionPreview(cleanSessionPreviewText(getMessageText((entry.message as UserMessage).content)));
       }
     } else if (entry.type === "custom_message") {
       messageCount += 1;
@@ -130,7 +171,10 @@ function parseSessionFileForIndex(filePath: string, size: number, mtimeMs: numbe
 
 export async function listAllSessions(): Promise<SessionInfo[]> {
   const index = await listAllSessionRecords();
-  return index.map((record) => record.info);
+  return index.map((record) => ({
+    ...record.info,
+    firstMessage: truncateSessionPreview(record.info.firstMessage),
+  }));
 }
 
 export async function listAllSessionRecords(): Promise<CachedSessionRecord[]> {
@@ -190,7 +234,7 @@ export async function listAllSessionsSlow(): Promise<SessionInfo[]> {
       created: s.created instanceof Date ? s.created.toISOString() : String(s.created),
       modified: s.modified instanceof Date ? s.modified.toISOString() : String(s.modified),
       messageCount: s.messageCount,
-      firstMessage: s.firstMessage || "(no messages)",
+      firstMessage: truncateSessionPreview(s.firstMessage || "(no messages)"),
       parentSessionId: s.parentSessionPath ? pathToId.get(s.parentSessionPath) : undefined,
     };
   });

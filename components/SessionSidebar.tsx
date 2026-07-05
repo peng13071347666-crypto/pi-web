@@ -187,7 +187,7 @@ function PiAgentTitle() {
         background: "none", border: "none", padding: 0, cursor: "default",
         fontWeight: 700, fontSize: 15, letterSpacing: "-0.01em",
         color: showVersion ? "var(--accent)" : "var(--text)",
-        fontFamily: "var(--font-mono)",
+        fontFamily: "var(--welcome-title-font)",
         minWidth: "6ch",
       }}
     >
@@ -276,8 +276,6 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         // Session not found — notify parent so it can show the placeholder
         onInitialRestoreDone?.();
       }
-      const cwds = getRecentCwds(allSessions);
-      if (cwds.length > 0) setSelectedCwd(cwds[0]);
     }
   }, [allSessions, selectedCwd, initialSessionId, onSelectSession, onInitialRestoreDone]);
 
@@ -339,17 +337,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  const recentCwds = getRecentCwds(allSessions);
+  const effectiveCwd = selectedCwdProp ?? selectedCwd ?? recentCwds[0] ?? null;
+
   const handleNewSession = useCallback(() => {
-    if (!selectedCwd) return;
+    if (!effectiveCwd) return;
     // Generate a temporary UUID client-side — no backend call needed.
     // Pi will be spawned lazily when the user sends the first message.
     const tempId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-    onNewSession?.(tempId, selectedCwd);
-  }, [selectedCwd, onNewSession]);
+    onNewSession?.(tempId, effectiveCwd);
+  }, [effectiveCwd, onNewSession]);
 
-  const recentCwds = getRecentCwds(allSessions);
   const filteredSessions = selectedCwd
     ? allSessions.filter((s) => s.cwd === selectedCwd)
     : allSessions;
@@ -372,33 +372,33 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           <div style={{ display: "flex", gap: 6 }}>
             <button
               onClick={handleNewSession}
-              disabled={!selectedCwd}
+              disabled={!effectiveCwd}
               style={{
                 display: "flex", alignItems: "center", justifyContent: "center", gap: 5,
                 background: "var(--bg-hover)",
                 border: "1px solid var(--border)",
-                color: selectedCwd ? "var(--text-muted)" : "var(--text-dim)",
-                cursor: selectedCwd ? "pointer" : "not-allowed",
+                color: effectiveCwd ? "var(--text-muted)" : "var(--text-dim)",
+                cursor: effectiveCwd ? "pointer" : "not-allowed",
                 height: 32,
                 paddingLeft: 10,
                 paddingRight: 12,
-                borderRadius: 7,
+                borderRadius: "var(--control-radius)",
                 fontSize: 12,
                 fontWeight: 500,
                 letterSpacing: "-0.01em",
                 flexShrink: 0,
                 transition: "background 0.12s, color 0.12s, border-color 0.12s",
               }}
-              title={selectedCwd ? `New session in ${selectedCwd}` : "Select a project first"}
+              title={effectiveCwd ? `New session in ${effectiveCwd}` : "Select a project first"}
               onMouseEnter={(e) => {
-                if (!selectedCwd) return;
+                if (!effectiveCwd) return;
                 e.currentTarget.style.background = "var(--bg-selected)";
                 e.currentTarget.style.color = "var(--accent)";
-                e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                e.currentTarget.style.borderColor = "var(--accent-border)";
               }}
               onMouseLeave={(e) => {
                 e.currentTarget.style.background = "var(--bg-hover)";
-                e.currentTarget.style.color = selectedCwd ? "var(--text-muted)" : "var(--text-dim)";
+                e.currentTarget.style.color = effectiveCwd ? "var(--text-muted)" : "var(--text-dim)";
                 e.currentTarget.style.borderColor = "var(--border)";
               }}
             >
@@ -417,7 +417,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 color: sessionRefreshDone ? "#4ade80" : "var(--text-muted)",
                 cursor: "pointer",
                 width: 32, height: 32,
-                borderRadius: 7,
+                borderRadius: "var(--control-radius)",
                 padding: 0,
                 flexShrink: 0,
                 transition: "background 0.3s, color 0.3s, border-color 0.3s",
@@ -426,7 +426,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 if (sessionRefreshDone) return;
                 e.currentTarget.style.background = "var(--bg-selected)";
                 e.currentTarget.style.color = "var(--accent)";
-                e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                e.currentTarget.style.borderColor = "var(--accent-border)";
               }}
               onMouseLeave={(e) => {
                 if (sessionRefreshDone) return;
@@ -459,9 +459,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
               display: "flex",
               alignItems: "center",
               padding: "6px 10px",
-              background: selectedCwd ? "var(--bg-hover)" : "rgba(37,99,235,0.06)",
-              border: selectedCwd ? "1px solid var(--border)" : "1px solid rgba(37,99,235,0.4)",
-              borderRadius: 7,
+              background: "var(--bg-hover)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--control-radius)",
               cursor: "pointer",
               fontSize: 12,
               color: "var(--text)",
@@ -477,11 +477,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 whiteSpace: "nowrap",
                 fontFamily: "var(--font-mono)",
                 fontSize: 11,
-                color: selectedCwd ? "var(--text)" : "var(--text-dim)",
+                color: "var(--text)",
               }}
-              title={selectedCwd ?? ""}
+              title={selectedCwd ?? "All sessions"}
             >
-              {selectedCwd ? shortenCwd(selectedCwd, homeDir) : (initialSessionId && !restoredRef.current ? "" : "Select project…")}
+              {selectedCwd ? shortenCwd(selectedCwd, homeDir) : "All sessions"}
             </span>
           </button>
 
@@ -493,13 +493,47 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 left: 0,
                 right: 0,
                 zIndex: 100,
-                background: "var(--bg)",
+                background: "var(--popover-bg)",
                 border: "1px solid var(--border)",
-                borderRadius: 8,
-                boxShadow: "0 6px 20px rgba(0,0,0,0.10)",
+                borderRadius: "var(--popover-radius)",
+                boxShadow: "var(--popover-shadow)",
                 overflow: "hidden",
               }}
             >
+              <button
+                onClick={() => {
+                  setSelectedCwd(null);
+                  setCustomPathOpen(false);
+                  setCustomPathValue("");
+                  setCustomPathError(null);
+                  setDropdownOpen(false);
+                }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  width: "100%",
+                  padding: "8px 10px",
+                  background: selectedCwd === null ? "var(--bg-selected)" : "none",
+                  border: "none",
+                  borderBottom: "1px solid var(--border)",
+                  color: selectedCwd === null ? "var(--text)" : "var(--text-muted)",
+                  cursor: "pointer",
+                  textAlign: "left",
+                  fontSize: 11,
+                }}
+                title="Show all sessions"
+              >
+                {selectedCwd === null ? (
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                    <polyline points="1.5 5 4 7.5 8.5 2.5" />
+                  </svg>
+                ) : (
+                  <span style={{ width: 10, flexShrink: 0 }} />
+                )}
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>All sessions</span>
+              </button>
+
               {recentCwds.map((cwd) => (
                 <button
                   key={cwd}
@@ -622,9 +656,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                       fontFamily: "var(--font-mono)",
                       padding: "5px 8px",
                       border: "1px solid var(--accent)",
-                      borderRadius: 5,
+                      borderRadius: "var(--control-radius)",
                       outline: "none",
-                      background: "var(--bg)",
+                      background: "var(--input-bg)",
                       color: "var(--text)",
                       boxSizing: "border-box",
                     }}
@@ -649,8 +683,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                         padding: "4px 0",
                         background: "var(--accent)",
                         border: "none",
-                        borderRadius: 5,
-                        color: "#fff",
+                        borderRadius: "var(--control-radius)",
+                        color: "var(--accent-contrast)",
                         fontSize: 11,
                         fontWeight: 600,
                         cursor: customPathValidating || !customPathValue.trim() ? "not-allowed" : "pointer",
@@ -666,7 +700,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                         padding: "4px 0",
                         background: "var(--bg-hover)",
                         border: "1px solid var(--border)",
-                        borderRadius: 5,
+                        borderRadius: "var(--control-radius)",
                         color: "var(--text-muted)",
                         fontSize: 11,
                         cursor: "pointer",
@@ -984,7 +1018,7 @@ function SessionItem({
                 display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
                 height: 30, padding: "0 11px",
                 background: "#ef4444", border: "none",
-                borderRadius: 6, color: "#fff",
+                borderRadius: "var(--control-radius)", color: "#fff",
                 cursor: "pointer", fontSize: 12, fontWeight: 600,
                 whiteSpace: "nowrap",
               }}
@@ -1003,7 +1037,7 @@ function SessionItem({
                 display: "flex", alignItems: "center", justifyContent: "center",
                 height: 30, padding: "0 11px",
                 background: "var(--bg)", border: "1px solid var(--border)",
-                borderRadius: 6, color: "var(--text-muted)",
+                borderRadius: "var(--control-radius)", color: "var(--text-muted)",
                 cursor: "pointer", fontSize: 12, fontWeight: 500,
                 whiteSpace: "nowrap",
               }}
@@ -1029,9 +1063,9 @@ function SessionItem({
             fontSize: 12,
             padding: "5px 8px",
             border: "1px solid var(--accent)",
-            borderRadius: 5,
+            borderRadius: "var(--control-radius)",
             outline: "none",
-            background: "var(--bg)",
+            background: "var(--input-bg)",
             color: "var(--text)",
             height: 30,
           }}
@@ -1099,14 +1133,14 @@ function SessionItem({
                   display: "flex", alignItems: "center", justifyContent: "center",
                   width: 32, height: 32, padding: 0,
                   background: "var(--bg-hover)", border: "1px solid var(--border)",
-                  borderRadius: 7, color: "var(--text-muted)",
+                  borderRadius: "var(--control-radius)", color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
                   transition: "background 0.12s, color 0.12s, border-color 0.12s",
                 }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = "var(--bg-selected)";
                   e.currentTarget.style.color = "var(--accent)";
-                  e.currentTarget.style.borderColor = "rgba(37,99,235,0.35)";
+                  e.currentTarget.style.borderColor = "var(--accent-border)";
                 }}
                 onMouseLeave={(e) => {
                   e.currentTarget.style.background = "var(--bg-hover)";
@@ -1125,7 +1159,7 @@ function SessionItem({
                   display: "flex", alignItems: "center", justifyContent: "center",
                   width: 32, height: 32, padding: 0,
                   background: "var(--bg-hover)", border: "1px solid var(--border)",
-                  borderRadius: 7, color: "var(--text-muted)",
+                  borderRadius: "var(--control-radius)", color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
                   transition: "background 0.12s, color 0.12s, border-color 0.12s",
                 }}

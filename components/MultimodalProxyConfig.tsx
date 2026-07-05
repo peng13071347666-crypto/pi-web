@@ -102,7 +102,7 @@ function ModelSelect({
 
   const options: { label: string; value: string }[] = [];
   options.push({ label: "— 未设置 —", value: "" });
-  for (const [provider, items] of byProvider) {
+  for (const [, items] of byProvider) {
     for (const m of items) {
       options.push({
         label: `${m.name || m.id}  [${m.provider}]`,
@@ -114,8 +114,6 @@ function ModelSelect({
     options.push({ label: `${value}（自定义，未在注册表中）`, value });
   }
   options.push({ label: "✏️ 手动输入…", value: "__custom__" });
-
-  const listId = useMemo(() => `model-datalist-${Math.random().toString(36).slice(2, 8)}`, []);
 
   return (
     <div style={{ position: "relative" }}>

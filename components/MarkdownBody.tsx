@@ -1,10 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vs } from "react-syntax-highlighter/dist/cjs/styles/prism";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { useTheme } from "@/hooks/useTheme";
 import { markdownRehypePlugins, markdownRemarkPlugins } from "@/lib/markdown";
 
@@ -12,6 +9,21 @@ interface MarkdownBodyProps {
   children: string;
   className?: string;
   isStreaming?: boolean;
+}
+
+interface SyntaxHighlighterBodyProps {
+  code: string;
+  lang: string;
+  isDark: boolean;
+}
+
+let syntaxHighlighterBodyPromise: Promise<ComponentType<SyntaxHighlighterBodyProps>> | null = null;
+
+function loadSyntaxHighlighterBody(): Promise<ComponentType<SyntaxHighlighterBodyProps>> {
+  if (!syntaxHighlighterBodyPromise) {
+    syntaxHighlighterBodyPromise = import("./SyntaxHighlighterBody").then((mod) => mod.SyntaxHighlighterBody);
+  }
+  return syntaxHighlighterBodyPromise;
 }
 
 function copyText(text: string): Promise<void> {
@@ -195,6 +207,17 @@ function MermaidBlock({ code, isStreaming }: { code: string; isStreaming?: boole
 function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; headerAction?: ReactNode }) {
   const { isDark } = useTheme();
   const [copied, setCopied] = useState(false);
+  const [SyntaxBody, setSyntaxBody] = useState<ComponentType<SyntaxHighlighterBodyProps> | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSyntaxHighlighterBody().then((component) => {
+      if (!cancelled) setSyntaxBody(() => component);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const copy = () => {
     copyText(code).then(() => {
@@ -217,23 +240,20 @@ function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; h
           </button>
         </div>
       </div>
-      <SyntaxHighlighter
-        language={lang || "text"}
-        style={isDark ? vscDarkPlus : vs}
-        showLineNumbers
-        lineNumberStyle={{ color: "var(--text-dim)", fontStyle: "normal" }}
-        customStyle={{
+      {SyntaxBody ? (
+        <SyntaxBody code={code} lang={lang} isDark={isDark} />
+      ) : (
+        <pre style={{
           margin: 0,
           padding: "11px 13px",
           fontSize: 12.5,
           lineHeight: 1.62,
-          borderRadius: 0,
+          overflowX: "auto",
           background: "color-mix(in srgb, var(--bg) 92%, var(--bg-panel))",
-        }}
-        codeTagProps={{ style: { fontFamily: "var(--font-mono)" } }}
-      >
-        {code}
-      </SyntaxHighlighter>
+        }}>
+          <code style={{ fontFamily: "var(--font-mono)", whiteSpace: "pre" }}>{code}</code>
+        </pre>
+      )}
     </div>
   );
 }

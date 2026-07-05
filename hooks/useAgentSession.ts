@@ -403,10 +403,17 @@ export interface AttachedImage {
   data: string;
   mimeType: string;
   previewUrl: string;
+  file?: AttachedFileRef;
+}
+
+function getHiddenImageFiles(images?: AttachedImage[]): AttachedFileRef[] {
+  return images
+    ?.map((img) => img.file)
+    .filter((file): file is AttachedFileRef => Boolean(file)) ?? [];
 }
 
 type SelectedModel = { provider: string; modelId: string };
-type ModelEntry = { id: string; name: string; provider: string };
+type ModelEntry = { id: string; name: string; provider: string; input?: string[] };
 type ModelsResponse = {
   models: Record<string, string>;
   modelList?: ModelEntry[];
@@ -497,6 +504,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const currentModel = currentModelOverride ?? data?.context.model ?? pendingModel ?? null;
   const displayModel = isNew ? (newSessionModel ?? newSessionDefaultModel) : currentModel;
+  const activeModelSupportsImages = (() => {
+    if (!displayModel) return false;
+    const entry = modelList.find((m) => m.provider === displayModel.provider && m.id === displayModel.modelId);
+    return entry?.input?.includes("image") ?? false;
+  })();
 
   const sessionStats = (() => {
     if (sessionStatsOverride) return sessionStatsOverride;
@@ -618,6 +630,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       });
       setCurrentModelOverride(null);
       setError(null);
+      if (d.agentState?.state?.contextUsage !== undefined) setContextUsage(d.agentState.state.contextUsage ?? null);
+      if (d.agentState?.state?.systemPrompt !== undefined) setSystemPrompt(d.agentState.state.systemPrompt ?? null);
+      if (d.agentState?.state?.isCompacting !== undefined) setIsCompacting(d.agentState.state.isCompacting);
       if (d.agentState?.state?.extensionStatuses) setExtensionStatuses(d.agentState.state.extensionStatuses);
       if (d.agentState?.state?.extensionWidgets) setExtensionWidgets(d.agentState.state.extensionWidgets);
       if (!d.agentState?.state?.thinkingLevel && nextContext.thinkingLevel && nextContext.thinkingLevel !== "off") {
@@ -1330,7 +1345,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (toolPreset === "none" && files?.length) {
       addNotice({ type: "warning", message: "Files were attached as paths. Enable tools if you want the model to read them." });
     }
-    const messageForAgent = messageWithFileRefs(trimmedMessage, files);
+    const hiddenImageFiles = getHiddenImageFiles(images);
+    const backendFiles = [...(files ?? []), ...hiddenImageFiles];
+    const messageForAgent = messageWithFileRefs(trimmedMessage, backendFiles);
+    const messageForUi = messageWithFileRefs(trimmedMessage, files);
     const isSlashCommandPrompt = !images?.length && !files?.length && trimmedMessage.startsWith("/");
     const promptRunId = promptRunIdRef.current + 1;
 
@@ -1338,8 +1356,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const userMsg: AgentMessage = {
       role: "user",
       content: imageBlocks?.length
-        ? [...(messageForAgent.trim() ? [{ type: "text" as const, text: messageForAgent }] : []), ...imageBlocks]
-        : messageForAgent,
+        ? [...(messageForUi.trim() ? [{ type: "text" as const, text: messageForUi }] : []), ...imageBlocks]
+        : messageForUi,
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, userMsg]);
@@ -1351,7 +1369,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     pendingScrollToUserRef.current = true;
     completionScrollAllowedRef.current = true;
 
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const shouldSendRawImages = activeModelSupportsImages || hiddenImageFiles.length === 0;
+    const piImages = shouldSendRawImages
+      ? images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+      : undefined;
 
     try {
       let sentSessionId: string | null = null;
@@ -1371,7 +1392,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             message: messageForAgent,
             ...(piImages?.length ? { images: piImages } : {}),
           });
-          promoteNewSession(1, messageForAgent);
+          promoteNewSession(1, messageForUi);
         } else {
           if (selectedModel) setPendingModel(selectedModel);
           const { PRESET_NONE, PRESET_DEFAULT, PRESET_FULL } = await import("@/components/ToolPanel");
@@ -1398,7 +1419,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             message: messageForAgent,
             ...(piImages?.length ? { images: piImages } : {}),
           });
-          promoteNewSession(1, messageForAgent);
+          promoteNewSession(1, messageForUi);
         }
       } else if (session) {
         sentSessionId = session.id;
@@ -1419,7 +1440,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
+  }, [activeModelSupportsImages, addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -1597,9 +1618,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleSteer = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    const messageForAgent = messageWithFileRefs(message, files);
-    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${messageForAgent}`, timestamp: Date.now() } as AgentMessage]);
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const hiddenImageFiles = getHiddenImageFiles(images);
+    const messageForAgent = messageWithFileRefs(message, [...(files ?? []), ...hiddenImageFiles]);
+    const messageForUi = messageWithFileRefs(message, files);
+    setMessages((prev) => [...prev, { role: "user", content: `[steer] ${messageForUi}`, timestamp: Date.now() } as AgentMessage]);
+    const shouldSendRawImages = activeModelSupportsImages || hiddenImageFiles.length === 0;
+    const piImages = shouldSendRawImages
+      ? images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+      : undefined;
     try {
       await sendAgentCommand(sid, {
         type: "steer",
@@ -1609,7 +1635,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       console.error("Failed to steer:", e);
     }
-  }, []);
+  }, [activeModelSupportsImages]);
 
   const handlePromptWithStreamingBehavior = useCallback(async (
     message: string,
@@ -1619,13 +1645,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   ) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    const messageForAgent = messageWithFileRefs(message, files);
+    const hiddenImageFiles = getHiddenImageFiles(images);
+    const messageForAgent = messageWithFileRefs(message, [...(files ?? []), ...hiddenImageFiles]);
+    const messageForUi = messageWithFileRefs(message, files);
     setMessages((prev) => [...prev, {
       role: "user",
-      content: behavior === "steer" ? `[steer] ${messageForAgent}` : messageForAgent,
+      content: behavior === "steer" ? `[steer] ${messageForUi}` : messageForUi,
       timestamp: Date.now(),
     } as AgentMessage]);
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const shouldSendRawImages = activeModelSupportsImages || hiddenImageFiles.length === 0;
+    const piImages = shouldSendRawImages
+      ? images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+      : undefined;
     try {
       await sendAgentCommand(sid, {
         type: "prompt",
@@ -1636,14 +1667,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       console.error("Failed to queue prompt:", e);
     }
-  }, []);
+  }, [activeModelSupportsImages]);
 
   const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[], files?: AttachedFileRef[]) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
-    const messageForAgent = messageWithFileRefs(message, files);
-    setMessages((prev) => [...prev, { role: "user", content: messageForAgent, timestamp: Date.now() } as AgentMessage]);
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+    const hiddenImageFiles = getHiddenImageFiles(images);
+    const messageForAgent = messageWithFileRefs(message, [...(files ?? []), ...hiddenImageFiles]);
+    const messageForUi = messageWithFileRefs(message, files);
+    setMessages((prev) => [...prev, { role: "user", content: messageForUi, timestamp: Date.now() } as AgentMessage]);
+    const shouldSendRawImages = activeModelSupportsImages || hiddenImageFiles.length === 0;
+    const piImages = shouldSendRawImages
+      ? images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+      : undefined;
     try {
       await sendAgentCommand(sid, {
         type: "follow_up",
@@ -1653,7 +1689,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (e) {
       console.error("Failed to follow up:", e);
     }
-  }, []);
+  }, [activeModelSupportsImages]);
 
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;

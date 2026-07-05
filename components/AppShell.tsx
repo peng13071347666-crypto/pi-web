@@ -1,18 +1,15 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
+import { createPortal } from "react-dom";
 import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
-import { FileViewer } from "./FileViewer";
-import { ArtifactsPanel } from "./ArtifactsPanel";
 import { TabBar, type Tab } from "./TabBar";
-import { ModelsConfig } from "./ModelsConfig";
-import { SkillsConfig } from "./SkillsConfig";
-import { AgentsConfig } from "./AgentsConfig";
-import { MultimodalProxyConfig } from "./MultimodalProxyConfig";
 import { BranchNavigator } from "./BranchNavigator";
 import { VersionBanner } from "./VersionBanner";
+import { AppearanceMenu } from "./AppearanceMenu";
 import { useTheme } from "@/hooks/useTheme";
 import { encodeFilePathForApi, getFileName } from "@/lib/file-paths";
 import type { ArtifactItem, SessionInfo, SessionTreeNode } from "@/lib/types";
@@ -21,6 +18,39 @@ import type { OpenPathAction } from "./ArtifactCards";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 
 type SessionCopyField = "file" | "id";
+type AgentStatePayload = {
+  systemPrompt?: string;
+  contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
+};
+
+function LazyPanelFallback() {
+  return (
+    <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>
+      Loading...
+    </div>
+  );
+}
+
+const FileViewer = dynamic(() => import("./FileViewer").then((mod) => mod.FileViewer), {
+  ssr: false,
+  loading: LazyPanelFallback,
+});
+const ArtifactsPanel = dynamic(() => import("./ArtifactsPanel").then((mod) => mod.ArtifactsPanel), {
+  ssr: false,
+  loading: LazyPanelFallback,
+});
+const ModelsConfig = dynamic(() => import("./ModelsConfig").then((mod) => mod.ModelsConfig), {
+  ssr: false,
+});
+const SkillsConfig = dynamic(() => import("./SkillsConfig").then((mod) => mod.SkillsConfig), {
+  ssr: false,
+});
+const AgentsConfig = dynamic(() => import("./AgentsConfig").then((mod) => mod.AgentsConfig), {
+  ssr: false,
+});
+const MultimodalProxyConfig = dynamic(() => import("./MultimodalProxyConfig").then((mod) => mod.MultimodalProxyConfig), {
+  ssr: false,
+});
 
 function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
@@ -76,10 +106,14 @@ export function AppShell() {
   }, []);
 
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  const [systemPromptLoading, setSystemPromptLoading] = useState(false);
+  const [systemPromptError, setSystemPromptError] = useState<string | null>(null);
   const systemBtnRef = useRef<HTMLButtonElement>(null);
 
   const handleSystemPromptChange = useCallback((prompt: string | null) => {
     setSystemPrompt(prompt);
+    setSystemPromptLoading(false);
+    setSystemPromptError(null);
   }, []);
 
   // Session stats (tokens + cost) — populated by ChatWindow, displayed in top bar
@@ -116,6 +150,36 @@ export function AppShell() {
   const toggleTopPanel = useCallback((panel: "branches" | "system" | "session") => {
     setActiveTopPanel((cur) => cur === panel ? null : panel);
   }, []);
+
+  const loadSystemPrompt = useCallback(async () => {
+    if (!selectedSession || systemPromptLoading) return;
+    setSystemPromptLoading(true);
+    setSystemPromptError(null);
+    try {
+      const res = await fetch(`/api/agent/${encodeURIComponent(selectedSession.id)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "get_state" }),
+      });
+      const body = await res.json().catch(() => ({})) as { success?: boolean; data?: AgentStatePayload; error?: string };
+      if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
+      const state = body.data;
+      if (state?.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt ?? null);
+      if (state?.contextUsage !== undefined) setContextUsage(state.contextUsage ?? null);
+    } catch (error) {
+      setSystemPromptError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSystemPromptLoading(false);
+    }
+  }, [selectedSession, systemPromptLoading]);
+
+  const handleSystemPanelClick = useCallback(() => {
+    const opening = activeTopPanel !== "system";
+    toggleTopPanel("system");
+    if (opening && selectedSession && systemPrompt === null) {
+      void loadSystemPrompt();
+    }
+  }, [activeTopPanel, loadSystemPrompt, selectedSession, systemPrompt, toggleTopPanel]);
 
   const openSessionStatsPanel = useCallback(() => {
     setActiveTopPanel("session");
@@ -205,6 +269,8 @@ export function AppShell() {
     setBranchTree([]);
     setBranchActiveLeafId(null);
     setSystemPrompt(null);
+    setSystemPromptError(null);
+    setSystemPromptLoading(false);
     setActiveTopPanel(null);
     router.replace("/", { scroll: false });
   }, [router]);
@@ -214,6 +280,8 @@ export function AppShell() {
     setSelectedSession(session);
     setSessionKey((k) => k + 1);
     setSystemPrompt(null);
+    setSystemPromptError(null);
+    setSystemPromptLoading(false);
     setInitialSessionRestored(true);
     if (isRestore) {
       // Suppress the redundant sessionKey bump that would come from the
@@ -234,6 +302,8 @@ export function AppShell() {
     setBranchTree([]);
     setBranchActiveLeafId(null);
     setSystemPrompt(null);
+    setSystemPromptError(null);
+    setSystemPromptLoading(false);
     setActiveTopPanel(null);
     router.replace("/", { scroll: false });
   }, [router]);
@@ -276,6 +346,8 @@ export function AppShell() {
       setBranchTree([]);
       setBranchActiveLeafId(null);
       setSystemPrompt(null);
+      setSystemPromptError(null);
+      setSystemPromptLoading(false);
       setActiveTopPanel(null);
       router.replace("/", { scroll: false });
     }
@@ -448,7 +520,7 @@ export function AppShell() {
             style={{
               flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
               height: 32, padding: 0, background: "none", border: "none",
-              borderRadius: 9, color: "var(--text-muted)", cursor: disabled ? "default" : "pointer",
+              borderRadius: "var(--control-radius)", color: "var(--text-muted)", cursor: disabled ? "default" : "pointer",
               fontSize: 12, opacity: disabled ? 0.35 : 1,
               transition: "background 0.12s, color 0.12s",
             }}
@@ -478,7 +550,7 @@ export function AppShell() {
           transform: translateY(0);
           filter: blur(0);
           background: color-mix(in srgb, var(--accent) 8%, var(--bg-panel));
-          box-shadow: 0 18px 44px rgba(37,99,235,0.16);
+          box-shadow: 0 18px 44px color-mix(in srgb, var(--accent) 16%, transparent);
         }
         100% {
           opacity: 1;
@@ -526,7 +598,7 @@ export function AppShell() {
         }
       }
     `}</style>
-    <div style={{ display: "flex", height: "100dvh", overflow: "hidden", background: "var(--bg)" }}>
+    <div style={{ display: "flex", height: "100dvh", overflow: "hidden", background: "var(--app-bg)" }}>
       {/* Mobile overlay backdrop */}
       <div
         className="sidebar-overlay-backdrop"
@@ -546,7 +618,7 @@ export function AppShell() {
       <div
         className={`sidebar-container${sidebarOpen ? " sidebar-open" : " sidebar-closed"}`}
         style={{
-          background: "var(--bg-panel)",
+          background: "var(--sidebar-bg)",
           borderRight: "1px solid var(--border)",
           display: "flex",
           flexDirection: "column",
@@ -561,7 +633,7 @@ export function AppShell() {
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         <VersionBanner refreshKey={modelsRefreshKey} />
         {/* Top bar with sidebar toggle */}
-        <div ref={topBarRef} style={{ display: "flex", alignItems: "center", flexShrink: 0, borderBottom: "1px solid var(--border)", height: 36, background: "var(--bg-panel)" }}>
+        <div ref={topBarRef} style={{ display: "flex", alignItems: "center", flexShrink: 0, borderBottom: "1px solid var(--border)", height: 36, background: "var(--topbar-bg)", backdropFilter: "saturate(1.1) blur(14px)" }}>
           <button
             onClick={() => setSidebarOpen((v) => !v)}
             title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
@@ -615,6 +687,7 @@ export function AppShell() {
               </svg>
             )}
           </button>
+          <AppearanceMenu />
           {showChat && (
             <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
               <button
@@ -681,7 +754,7 @@ export function AppShell() {
               />
               <button
                 ref={systemBtnRef}
-                onClick={() => toggleTopPanel("system")}
+                onClick={handleSystemPanelClick}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   height: "100%", padding: "0 12px",
@@ -799,20 +872,33 @@ export function AppShell() {
             );
           })()}
           {/* Top panel dropdown — shared, only one active at a time */}
-          {activeTopPanel && topPanelPos && (
-            <div style={{
+          {activeTopPanel && topPanelPos && typeof document !== "undefined" && createPortal((
+            <div data-pi-top-panel={activeTopPanel} style={{
               position: "fixed",
               top: topPanelPos.top,
               left: topPanelPos.left,
               width: topPanelPos.width,
-              zIndex: 500,
+              zIndex: 1800,
+              pointerEvents: "auto",
+              isolation: "isolate",
             }}>
               {activeTopPanel === "system" && (
                 <div style={{
-                  background: "var(--bg-panel)",
-                  borderBottom: "1px solid var(--border)",
+                  background: "var(--popover-bg)",
+                  border: "1px solid var(--border)",
+                  borderTop: "none",
+                  boxShadow: "var(--popover-shadow)",
+                  opacity: 1,
                 }}>
-                  {systemPrompt ? (
+                  {systemPromptLoading && systemPrompt === null ? (
+                    <div style={{ padding: "12px 16px", fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>
+                      Loading system prompt...
+                    </div>
+                  ) : systemPromptError ? (
+                    <div style={{ padding: "12px 16px", fontSize: 12, color: "#f87171", fontStyle: "italic" }}>
+                      Failed to load system prompt: {systemPromptError}
+                    </div>
+                  ) : systemPrompt ? (
                     <div style={{
                       maxHeight: "min(600px, 75vh)",
                       overflowY: "auto",
@@ -831,7 +917,7 @@ export function AppShell() {
                     </div>
                   ) : (
                     <div style={{ padding: "10px 16px", fontSize: 12, color: "var(--text-muted)", fontStyle: "italic" }}>
-                      Send a message to load the system prompt
+                      {selectedSession ? "Click System again to retry loading the system prompt" : "Open a session to load the system prompt"}
                     </div>
                   )}
                 </div>
@@ -840,7 +926,7 @@ export function AppShell() {
                 <div className="session-info-popover" style={{
                   background: "var(--bg-panel)",
                   borderBottom: "1px solid var(--border)",
-                  boxShadow: "0 10px 28px rgba(0,0,0,0.10)",
+                  boxShadow: "var(--popover-shadow)",
                   padding: "12px 16px",
                 }}>
                   {sessionStats ? (() => {
@@ -989,7 +1075,7 @@ export function AppShell() {
                 </div>
               )}
             </div>
-          )}
+          ), document.body)}
 
         </div>
 
@@ -1057,7 +1143,7 @@ export function AppShell() {
           overflow: "hidden",
           transition: "width 0.2s ease, min-width 0.2s ease",
           borderLeft: rightPanelOpen ? "1px solid var(--border)" : "none",
-          background: "var(--bg)",
+          background: "var(--popover-bg)",
         } as CSSProperties}
       >
         {rightPanelOpen && (
@@ -1137,8 +1223,22 @@ export function AppShell() {
           ) : activeFileTab?.filePath ? (
             <FileViewer filePath={activeFileTab.filePath} cwd={activeCwd ?? undefined} />
           ) : (
-            <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>
-              No file open
+            <div style={{
+              height: "100%",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 6,
+              color: "var(--text-dim)",
+              fontSize: 12,
+              textAlign: "center",
+              padding: 24,
+            }}>
+              <div style={{ color: "var(--text-muted)", fontWeight: 600 }}>No file selected</div>
+              <div style={{ maxWidth: 280, lineHeight: 1.5 }}>
+                Files previews attachments, tool-read files, and artifacts.
+              </div>
             </div>
           )}
         </div>

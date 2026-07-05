@@ -44,7 +44,10 @@ export function VersionBanner({ refreshKey }: { refreshKey?: number }) {
   }, []);
 
   useEffect(() => {
-    load();
+    const timer = window.setTimeout(() => {
+      void load();
+    }, 1200);
+    return () => window.clearTimeout(timer);
   }, [load, refreshKey]);
 
   if (!result || result.status === "ok" || dismissed) return null;

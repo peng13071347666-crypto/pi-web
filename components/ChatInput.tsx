@@ -8,6 +8,7 @@ export interface AttachedImage {
   data: string;   // base64, no prefix
   mimeType: string;
   previewUrl: string; // object URL for display
+  file?: AttachedFileRef; // uploaded path for vision tools; not shown as a file card
 }
 
 interface ModelOption {
@@ -58,12 +59,35 @@ export interface ChatInputHandle {
 const TOOL_PRESETS = ["off", "default", "full"] as const;
 const TOOL_PRESET_MAP: Record<"off" | "default" | "full", "none" | "default" | "full"> = { off: "none", default: "default", full: "full" };
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
+const TEXTAREA_MAX_HEIGHT = 168;
 const MODEL_OPTION_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const IMAGE_FILE_EXT_RE = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  avif: "image/avif",
+};
 
 function compareModelOptions(a: ModelOption, b: ModelOption): number {
   return MODEL_OPTION_COLLATOR.compare(a.name || a.modelId, b.name || b.modelId)
     || MODEL_OPTION_COLLATOR.compare(a.provider, b.provider)
     || MODEL_OPTION_COLLATOR.compare(a.modelId, b.modelId);
+}
+
+function isImageFile(file: File): boolean {
+  return file.type.startsWith("image/") || IMAGE_FILE_EXT_RE.test(file.name);
+}
+
+function getImageMimeType(file: File): string {
+  if (file.type.startsWith("image/")) return file.type;
+  const ext = file.name.toLowerCase().split(".").pop() ?? "";
+  return IMAGE_MIME_BY_EXT[ext] ?? "image/png";
 }
 
 const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -164,7 +188,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         if (!ta) return;
         ta.focus();
         ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        ta.style.height = `${Math.min(ta.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
       });
     },
     insertText(text: string) {
@@ -186,30 +210,54 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         ta.setSelectionRange(pos, pos);
         ta.focus();
         ta.style.height = "auto";
-        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+        ta.style.height = `${Math.min(ta.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
       });
     },
     addImages(files: File[]) {
-      processImageFiles(files);
+      processDroppedFiles(files.filter(isImageFile));
     },
     addFiles(files: File[]) {
       processDroppedFiles(files);
     },
   }));
 
-  const processImageFiles = useCallback(async (files: File[]) => {
-    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+  // File attachment state and handlers
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
+  const [uploadingFiles, setUploadingFiles] = useState(false);
+  const [fileUploadError, setFileUploadError] = useState<string | null>(null);
+
+  const uploadAttachmentFiles = useCallback(async (files: File[]) => {
+    if (!files.length) return [];
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file, file.name));
+    const res = await fetch("/api/attachments", {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json() as { attachments?: AttachedFileRef[]; error?: string };
+    if (!res.ok) throw new Error(data.error ?? `Upload failed (${res.status})`);
+    return data.attachments ?? [];
+  }, []);
+
+  const processImageFiles = useCallback(async (files: File[], uploadedFiles?: AttachedFileRef[]) => {
+    const imageFiles = files.filter(isImageFile);
     if (!imageFiles.length) return;
     const newImages = await Promise.all(
       imageFiles.map(
-        (file) =>
+        (file, index) =>
           new Promise<AttachedImage>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => {
               const result = reader.result as string;
               // result is "data:<mime>;base64,<data>"
-              const base64 = result.split(",")[1];
-              resolve({ data: base64, mimeType: file.type, previewUrl: URL.createObjectURL(file) });
+              const base64 = result.split(",")[1] ?? "";
+              const uploaded = uploadedFiles?.[index];
+              resolve({
+                data: base64,
+                mimeType: getImageMimeType(file),
+                previewUrl: URL.createObjectURL(file),
+                ...(uploaded ? { file: uploaded } : {}),
+              });
             };
             reader.onerror = reject;
             reader.readAsDataURL(file);
@@ -235,35 +283,23 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, []);
 
-  // File attachment state and handlers
-  const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
-  const [uploadingFiles, setUploadingFiles] = useState(false);
-  const [fileUploadError, setFileUploadError] = useState<string | null>(null);
-
-  const uploadAttachmentFiles = useCallback(async (files: File[]) => {
-    if (!files.length) return [];
-    const form = new FormData();
-    files.forEach((file) => form.append("files", file, file.name));
-    const res = await fetch("/api/attachments", {
-      method: "POST",
-      body: form,
-    });
-    const data = await res.json() as { attachments?: AttachedFileRef[]; error?: string };
-    if (!res.ok) throw new Error(data.error ?? `Upload failed (${res.status})`);
-    return data.attachments ?? [];
-  }, []);
-
   const processDroppedFiles = useCallback(async (files: File[]) => {
-    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+    const imageFiles = files.filter(isImageFile);
+    const nonImageFiles = files.filter((f) => !isImageFile(f));
 
     setFileUploadError(null);
-    if (imageFiles.length > 0) {
-      await processImageFiles(imageFiles);
-    }
-
+    if (!imageFiles.length && !nonImageFiles.length) return;
     setUploadingFiles(true);
     try {
-      const newFiles = await uploadAttachmentFiles(files);
+      if (imageFiles.length > 0) {
+        const uploadedImages = await uploadAttachmentFiles(imageFiles).catch((error) => {
+          setFileUploadError(error instanceof Error ? error.message : String(error));
+          return [];
+        });
+        await processImageFiles(imageFiles, uploadedImages);
+      }
+      if (!nonImageFiles.length) return;
+      const newFiles = await uploadAttachmentFiles(nonImageFiles);
       if (newFiles.length > 0) setAttachedFiles((prev) => [...prev, ...newFiles]);
     } catch (error) {
       setFileUploadError(error instanceof Error ? error.message : String(error));
@@ -362,7 +398,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       ta.focus();
       ta.setSelectionRange(nextValue.length, nextValue.length);
       ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      ta.style.height = `${Math.min(ta.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
     });
   }, []);
 
@@ -510,7 +546,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const ta = textareaRef.current;
     if (!ta) return;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+    ta.style.height = `${Math.min(ta.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
   }, []);
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -629,6 +665,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     : null;
   const hasPendingContent = Boolean(value.trim() || attachedImages.length || attachedFiles.length);
   const canSubmitPendingContent = hasPendingContent && !uploadingFiles;
+  const inputIsExpanded = value.length > 96 || value.includes("\n") || attachedImages.length > 0 || attachedFiles.length > 0;
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -660,7 +697,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       onDrop={handleDrop}
       style={{
         flexShrink: 0,
-        background: isDragging ? "rgba(59,130,246,0.05)" : "transparent",
+        background: isDragging ? "color-mix(in srgb, var(--accent) 6%, transparent)" : "transparent",
         padding: "0 16px 8px",
         paddingRight: 52, // 16px base + 36px for ChatMinimap alignment
         transition: "background 0.15s",
@@ -675,8 +712,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          background: "rgba(59,130,246,0.08)",
-          border: "2px dashed rgba(59,130,246,0.5)",
+          background: "color-mix(in srgb, var(--accent) 8%, transparent)",
+          border: "2px dashed color-mix(in srgb, var(--accent) 48%, transparent)",
           borderRadius: 16,
           zIndex: 100,
           pointerEvents: "none",
@@ -688,12 +725,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             alignItems: "center",
             gap: 8,
           }}>
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="rgba(59,130,246,0.7)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="17 8 12 3 7 8" />
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
-            <span style={{ color: "rgba(59,130,246,0.8)", fontSize: 14, fontWeight: 500 }}>
+            <span style={{ color: "var(--accent)", fontSize: 14, fontWeight: 500 }}>
               拖放文件到这里
             </span>
           </div>
@@ -711,7 +748,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           e.target.value = "";
         }}
       />
-      <div style={{ maxWidth: 820, margin: "0 auto" }}>
+      <div style={{ maxWidth: "var(--chat-max-width)", margin: "0 auto" }}>
         {/* Retry banner */}
         {retryInfo && (
           <div style={{
@@ -758,8 +795,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         {uploadingFiles && (
           <div style={{
             marginBottom: 8, padding: "5px 10px",
-            background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.22)",
-            borderRadius: 6, fontSize: 12, color: "rgba(37,99,235,0.95)",
+            background: "color-mix(in srgb, var(--accent) 8%, transparent)", border: "1px solid color-mix(in srgb, var(--accent) 22%, transparent)",
+            borderRadius: "var(--control-radius)", fontSize: 12, color: "var(--accent)",
           }}>
             Uploading attachments...
           </div>
@@ -799,7 +836,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             {attachedFiles.map((file, i) => (
               (() => {
                 const isReadable = file.previewKind === "text" || file.previewKind === "image" || file.previewKind === "pdf" || file.previewKind === "docx";
-                const accent = isReadable ? "rgba(59,130,246,0.8)" : "rgba(249,115,22,0.8)";
+                const accent = isReadable ? "var(--accent)" : "rgba(249,115,22,0.8)";
                 return (
               <div
                 key={i}
@@ -810,9 +847,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   alignItems: "center",
                   gap: 6,
                   padding: "6px 10px",
-                  background: isReadable ? "rgba(59,130,246,0.08)" : "rgba(249,115,22,0.08)",
-                  border: `1px solid ${isReadable ? "rgba(59,130,246,0.2)" : "rgba(249,115,22,0.2)"}`,
-                  borderRadius: 6,
+                  background: isReadable ? "color-mix(in srgb, var(--accent) 8%, transparent)" : "rgba(249,115,22,0.08)",
+                  border: `1px solid ${isReadable ? "color-mix(in srgb, var(--accent) 20%, transparent)" : "rgba(249,115,22,0.2)"}`,
+                  borderRadius: "var(--control-radius)",
                   fontSize: 12,
                   color: "var(--text)",
                   maxWidth: 200,
@@ -860,10 +897,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 right: 0,
                 bottom: "calc(100% + 8px)",
                 zIndex: 120,
-                background: "var(--bg)",
+                background: "var(--popover-bg)",
                 border: "1px solid var(--border)",
-                borderRadius: 8,
-                boxShadow: "0 -6px 20px rgba(0,0,0,0.12)",
+                borderRadius: "var(--popover-radius)",
+                boxShadow: "var(--popover-shadow)",
                 overflow: "hidden",
                 maxHeight: "min(56vh, 460px)",
               }}
@@ -901,7 +938,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                           justifyContent: "space-between",
                           gap: 8,
                           padding: "4px 0 6px",
-                          background: "var(--bg)",
+                          background: "var(--popover-bg)",
                           color: "var(--text-dim)",
                           fontSize: 10,
                           fontWeight: 600,
@@ -982,17 +1019,18 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             </div>
           )}
           <div
+            data-pi-chat-input-shell
             style={{
               display: "flex",
               gap: 8,
               alignItems: "center",
-              background: "var(--bg)",
+              background: "var(--input-bg)",
               border: `1px solid ${isStreaming && (onSteer || onFollowUp)
                 ? "rgba(234,179,8,0.4)"
-                : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
-              borderRadius: 14,
+                : "var(--input-border)"}`,
+              borderRadius: inputIsExpanded ? "var(--input-expanded-radius, var(--input-radius))" : "var(--input-radius)",
               padding: "10px 10px 10px 14px",
-              boxShadow: "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
+              boxShadow: "var(--input-shadow)",
               transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
             } as React.CSSProperties}
           >
@@ -1028,7 +1066,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               lineHeight: 1.6,
               fontFamily: "inherit",
               minHeight: 24,
-              maxHeight: 200,
+              maxHeight: TEXTAREA_MAX_HEIGHT,
               overflow: "auto",
             }}
           />
@@ -1045,7 +1083,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     padding: "7px 12px",
                     background: canSubmitPendingContent ? "rgba(234,179,8,0.12)" : "none",
                     border: "1px solid rgba(234,179,8,0.35)",
-                    borderRadius: 8,
+                    borderRadius: "var(--control-radius)",
                     color: canSubmitPendingContent ? "rgba(180,130,0,1)" : "var(--text-dim)",
                     cursor: canSubmitPendingContent ? "pointer" : "not-allowed",
                     fontSize: 13, fontWeight: 600, letterSpacing: "-0.01em",
@@ -1068,7 +1106,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     padding: "7px 12px",
                     background: canSubmitPendingContent ? "rgba(129,140,248,0.12)" : "none",
                     border: "1px solid rgba(129,140,248,0.35)",
-                    borderRadius: 8,
+                    borderRadius: "var(--control-radius)",
                     color: canSubmitPendingContent ? "rgba(99,102,241,1)" : "var(--text-dim)",
                     cursor: canSubmitPendingContent ? "pointer" : "not-allowed",
                     fontSize: 13, fontWeight: 600, letterSpacing: "-0.01em",
@@ -1094,13 +1132,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 padding: "7px 14px",
                 background: canSubmitPendingContent ? "var(--accent)" : "var(--bg-panel)",
                 border: "none",
-                borderRadius: 8,
-                color: canSubmitPendingContent ? "#fff" : "var(--text-dim)",
+                borderRadius: "var(--control-radius)",
+                color: canSubmitPendingContent ? "var(--accent-contrast)" : "var(--text-dim)",
                 cursor: canSubmitPendingContent ? "pointer" : "not-allowed",
                 fontSize: 13,
                 fontWeight: 600,
                 letterSpacing: "-0.01em",
-                boxShadow: canSubmitPendingContent ? "0 1px 3px rgba(37,99,235,0.25)" : "none",
+                boxShadow: canSubmitPendingContent ? "0 2px 8px color-mix(in srgb, var(--accent) 28%, transparent)" : "none",
                 transition: "background 0.15s, box-shadow 0.15s",
               }}
             >
@@ -1127,7 +1165,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
                 width: 32, height: 32, padding: 0,
                 background: "none", border: "none",
-                borderRadius: 9,
+                borderRadius: "var(--control-radius)",
                 color: attachedImages.length ? "var(--accent)" : "var(--text-muted)",
                 cursor: isStreaming ? "not-allowed" : "pointer",
                 opacity: isStreaming ? 0.5 : 1,
@@ -1166,7 +1204,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                       maxWidth: 220, overflow: "hidden",
                       background: modelDropdownOpen ? "var(--bg-hover)" : "none",
                       border: "none",
-                      borderRadius: 9,
+                borderRadius: "var(--control-radius)",
                       color: "var(--text-muted)",
                       cursor: isStreaming ? "not-allowed" : "pointer",
                       fontSize: 12,
@@ -1201,8 +1239,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                       <div ref={modelDropdownPanelRef} style={{
                       position: "fixed",
                       bottom, left: modelDropdownRect.left,
-                      zIndex: 500, background: "var(--bg)", border: "1px solid var(--border)",
-                      borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
+                      zIndex: 500, background: "var(--popover-bg)", border: "1px solid var(--border)",
+                      borderRadius: "var(--popover-radius)", boxShadow: "var(--popover-shadow)",
                       overflow: "hidden", width: "max-content", minWidth: modelDropdownRect.width, maxHeight: maxH, overflowY: "auto",
                       }}>
                       {modelsByProvider.map((group, gi) => (
@@ -1269,7 +1307,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     height: 32,
                     background: thinkingDropdownOpen ? "var(--bg-hover)" : "none",
                     border: "none",
-                    borderRadius: 9,
+                    borderRadius: "var(--control-radius)",
                     color: "var(--text-muted)",
                     cursor: isStreaming ? "not-allowed" : "pointer",
                     fontSize: 12,
@@ -1301,8 +1339,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 {thinkingDropdownOpen && (
                   <div style={{
                     position: "absolute", bottom: "calc(100% + 6px)", right: 0,
-                    zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
-                    borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
+                    zIndex: 100, background: "var(--popover-bg)", border: "1px solid var(--border)",
+                    borderRadius: "var(--popover-radius)", boxShadow: "var(--popover-shadow)",
                     overflow: "hidden", minWidth: 180,
                   }}>
                     {THINKING_LEVELS.filter((lvl) => {
@@ -1359,7 +1397,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     height: 32,
                     background: toolDropdownOpen ? "var(--bg-hover)" : "none",
                     border: "none",
-                    borderRadius: 9,
+                    borderRadius: "var(--control-radius)",
                     color: "var(--text-muted)",
                     cursor: isStreaming ? "not-allowed" : "pointer",
                     fontSize: 12,
@@ -1384,8 +1422,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 {toolDropdownOpen && (
                   <div style={{
                     position: "absolute", bottom: "calc(100% + 6px)", right: 0,
-                    zIndex: 100, background: "var(--bg)", border: "1px solid var(--border)",
-                    borderRadius: 8, boxShadow: "0 -4px 16px rgba(0,0,0,0.10)",
+                    zIndex: 100, background: "var(--popover-bg)", border: "1px solid var(--border)",
+                    borderRadius: "var(--popover-radius)", boxShadow: "var(--popover-shadow)",
                     overflow: "hidden", minWidth: 120,
                   }}>
                     {TOOL_PRESETS.map((lvl) => {
@@ -1444,7 +1482,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     height: 32,
                     background: isCompacting ? "rgba(239,68,68,0.08)" : "none",
                     border: "none",
-                    borderRadius: 9,
+                    borderRadius: "var(--control-radius)",
                     color: isCompacting ? "#ef4444" : "var(--text-muted)",
                     cursor: (isStreaming && !isCompacting) ? "not-allowed" : "pointer",
                     fontSize: 12, opacity: (isStreaming && !isCompacting) ? 0.5 : 1,
@@ -1483,7 +1521,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   height: 32,
                   background: "rgba(239,68,68,0.08)",
                   border: "1px solid rgba(239,68,68,0.3)",
-                  borderRadius: 9,
+                  borderRadius: "var(--control-radius)",
                   color: "#ef4444",
                   cursor: "pointer",
                   fontSize: 12, fontWeight: 600,
@@ -1509,7 +1547,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   width: 32, height: 32, padding: 0,
                   background: "none",
                   border: "none",
-                  borderRadius: 9,
+                  borderRadius: "var(--control-radius)",
                   color: soundEnabled ? "var(--text-muted)" : "var(--text-dim)",
                   cursor: "pointer",
                   opacity: soundEnabled ? 1 : 0.55,

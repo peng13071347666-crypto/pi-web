@@ -1,8 +1,16 @@
 diff --git a/node_modules/pi-multimodal-proxy/extensions/internal.ts b/node_modules/pi-multimodal-proxy/extensions/internal.ts
-index 50f7eec..e0f27da 100644
+index 96ac213..e621332 100644
 --- a/node_modules/pi-multimodal-proxy/extensions/internal.ts
 +++ b/node_modules/pi-multimodal-proxy/extensions/internal.ts
-@@ -494,8 +494,8 @@ export const ASSISTANT_TRUNCATE_CHARS = 500;
+@@ -36,6 +36,7 @@ export interface VisionConfig {
+ 	modelId: string;
+ 	systemPrompt: string;
+ 	includeContext: boolean;
++	consent?: "yes" | "no";
+ 	// 1.4.0 additions — all optional for backwards compat
+ 	tool: ToolSetting;
+ 	maxImagesPerCall: number;
+@@ -494,8 +495,8 @@ export const ASSISTANT_TRUNCATE_CHARS = 500;
  export const CONTEXT_MAX_CHARS = 3000;
  export const HASH_HEX_LEN = 32;
  
@@ -13,3 +21,194 @@ index 50f7eec..e0f27da 100644
  
  export const DEFAULT_VIDEO_SYSTEM_PROMPT = [
  	"You are a precise video analysis assistant.",
+@@ -563,7 +564,7 @@ function getLegacyPersistentConfigPath(agentDir?: string): string {
+ 
+ const PERSISTED_CONFIG_KEYS = new Set([
+ 	"mode", "provider", "modelId", "systemPrompt", "includeContext",
+-	"tool", "maxImagesPerCall", "maxBatch", "cacheSize",
++	"consent", "tool", "maxImagesPerCall", "maxBatch", "cacheSize",
+ 	"pHashSimilarityThreshold", "groundingModels",
+ 	"videoProvider", "videoModelId", "videoSystemPrompt",
+ ]);
+@@ -709,6 +710,14 @@ export function sanitize(config: VisionConfig): VisionConfig {
+ 	}
+ 	if (typeof safe.includeContext !== "boolean") safe.includeContext = DEFAULT_CONFIG.includeContext;
+ 	if (typeof safe.systemPrompt !== "string" || !safe.systemPrompt) safe.systemPrompt = DEFAULT_CONFIG.systemPrompt;
++	const consent = safe.consent as unknown;
++	if (consent === true || consent === "yes" || consent === "true" || consent === "1" || consent === "on") {
++		safe.consent = "yes";
++	} else if (consent === false || consent === "no" || consent === "false" || consent === "0" || consent === "off") {
++		safe.consent = "no";
++	} else {
++		delete safe.consent;
++	}
+ 	// 1.4.0 fields
+ 	if (safe.tool !== "on" && safe.tool !== "off") safe.tool = DEFAULT_CONFIG.tool;
+ 	if (!Number.isFinite(safe.maxImagesPerCall) || safe.maxImagesPerCall < 1 || safe.maxImagesPerCall > 20) {
+@@ -771,6 +780,10 @@ export function findDescriptions(entries: readonly SessionEntry[]): Map<string,
+ }
+ 
+ export function hasConsent(entries: readonly SessionEntry[], provider?: string): boolean {
++	return getSessionConsent(entries, provider) === true;
++}
++
++function getSessionConsent(entries: readonly SessionEntry[], provider?: string): boolean | undefined {
+ 	for (let i = entries.length - 1; i >= 0; i--) {
+ 		const e = entries[i];
+ 		if (e?.type === "custom" && e.customType === CUSTOM_TYPE_CONSENT && e.data) {
+@@ -791,7 +804,17 @@ export function hasConsent(entries: readonly SessionEntry[], provider?: string):
+ 			return true;
+ 		}
+ 	}
+-	return false;
++	return undefined;
++}
++
++export function hasEffectiveConsent(
++	entries: readonly SessionEntry[],
++	provider?: string,
++	config?: Pick<VisionConfig, "consent">,
++): boolean {
++	const sessionConsent = getSessionConsent(entries, provider);
++	if (sessionConsent !== undefined) return sessionConsent;
++	return config?.consent === "yes";
+ }
+ 
+ // ── Image helpers ──────────────────────────────────────────────────────────
+@@ -1090,9 +1113,11 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
+ 
+ 	const tmp = await canonical(os.tmpdir?.() ?? "/tmp");
+ 	const cwd = await canonical(process.cwd());
++	const piWebAttachments = await canonical(join(os.homedir(), ".pi", "agent", "web-attachments"));
+ 
+ 	if (tmp && isInsideOrSame(resolved, tmp)) return true;
+ 	if (cwd && isInsideOrSame(resolved, cwd)) return true;
++	if (piWebAttachments && isInsideOrSame(resolved, piWebAttachments)) return true;
+ 
+ 	// On Unix, /tmp (the POSIX system-wide temp dir) may differ from os.tmpdir()
+ 	// (e.g. on macOS where os.tmpdir() returns a per-user dir like /var/folders/…/T).
+diff --git a/node_modules/pi-multimodal-proxy/extensions/vision-proxy.ts b/node_modules/pi-multimodal-proxy/extensions/vision-proxy.ts
+index 4e0c647..6cba056 100644
+--- a/node_modules/pi-multimodal-proxy/extensions/vision-proxy.ts
++++ b/node_modules/pi-multimodal-proxy/extensions/vision-proxy.ts
+@@ -93,7 +93,7 @@ import {
+ 	getGroundingFormat,
+ 	type GroundingFormat,
+ 	isGroundingExcluded,
+-	hasConsent,
++	hasEffectiveConsent,
+ 	hashImageData,
+ 	hammingDistance,
+ 	type ImageMeta,
+@@ -520,7 +520,7 @@ async function ensureConsent(
+ 	entries: readonly SessionEntry[],
+ 	pi: ExtensionAPI,
+ ): Promise<boolean> {
+-	if (hasConsent(entries, config.provider)) return true;
++	if (hasEffectiveConsent(entries, config.provider, config)) return true;
+ 	const message =
+ 		`Send image data${config.includeContext ? " and recent conversation context" : ""} ` +
+ 		`to ${modelLabel(config)}? (one-time consent for this session)`;
+@@ -552,7 +552,7 @@ async function analyzeImages(
+ 	config: VisionConfig,
+ 	ctx: ExtensionContext,
+ ): Promise<AnalysisResult[] | null> {
+-	const visionModel = ctx.modelRegistry.find(config.provider, config.modelId);
++	let visionModel = ctx.modelRegistry.find(config.provider, config.modelId);
+ 	if (!visionModel) {
+ 		ctx.ui.notify(
+ 			`[multimodal-proxy] Model "${modelLabel(config)}" not found. Use /multimodal-proxy pick to choose one.`,
+@@ -560,7 +560,10 @@ async function analyzeImages(
+ 		);
+ 		return null;
+ 	}
+-	if (!visionModel.input.includes("image")) {
++	if (!visionModel.api) {
++		visionModel = { ...visionModel, api: "openai-completions" };
++	}
++	if (!visionModel.input?.includes("image")) {
+ 		ctx.ui.notify(
+ 			`[multimodal-proxy] "${visionModel.name ?? modelLabel(config)}" doesn't support images!`,
+ 			"error",
+@@ -1061,17 +1064,20 @@ async function handleAnalyzeImage(
+ 	}
+ 
+ 	// Verify model exists and supports images
+-	const visionModel = ctx.modelRegistry.find(visionProvider, visionModelId);
++	let visionModel = ctx.modelRegistry.find(visionProvider, visionModelId);
+ 	if (!visionModel) {
+ 		return `Error: model "${visionProvider}/${visionModelId}" not found in registry. Use /multimodal-proxy pick to choose a vision model.`;
+ 	}
+-	if (!visionModel.input.includes("image")) {
++	if (!visionModel.api) {
++		visionModel = { ...visionModel, api: "openai-completions" };
++	}
++	if (!visionModel.input?.includes("image")) {
+ 		return `Error: model "${visionModel.name ?? visionModelId}" does not support image input.`;
+ 	}
+ 
+ 	// Check consent for the resolved vision provider
+ 	const entries = ctx.sessionManager.getEntries();
+-	if (!hasConsent(entries, visionProvider)) {
++	if (!hasEffectiveConsent(entries, visionProvider, { ...config, provider: visionProvider, modelId: visionModelId })) {
+ 		return `Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes`
+ 	}
+ 
+@@ -1877,7 +1883,7 @@ export default function (pi: ExtensionAPI) {
+ 				}
+ 				ctx.ui.notify(
+ 					`[multimodal-proxy] Consent: ${
+-						hasConsent(entries, effective.provider) ? "granted" : "not granted"
++						hasEffectiveConsent(entries, effective.provider, effective) ? "granted" : "not granted"
+ 					}. Use /multimodal-proxy consent yes|no.`,
+ 					"info",
+ 				);
+@@ -2129,12 +2135,19 @@ export default function (pi: ExtensionAPI) {
+ 				}
+ 
+ 				// Check consent
+-				const descVisionModel = ctx.modelRegistry.find(descConfig.provider, descConfig.modelId);
++				let descVisionModel = ctx.modelRegistry.find(descConfig.provider, descConfig.modelId);
+ 				if (!descVisionModel) {
+ 					ctx.ui.notify(`[multimodal-proxy] Model \"${modelLabel(descConfig)}\" not found. Use /multimodal-proxy pick to choose one.`, "error");
+ 					return;
+ 				}
+-				if (!hasConsent(entries, descConfig.provider)) {
++				if (!descVisionModel.api) {
++					descVisionModel = { ...descVisionModel, api: "openai-completions" };
++				}
++				if (!descVisionModel.input?.includes("image")) {
++					ctx.ui.notify(`[multimodal-proxy] "${descVisionModel.name ?? modelLabel(descConfig)}" doesn't support images!`, "error");
++					return;
++				}
++				if (!hasEffectiveConsent(entries, descConfig.provider, descConfig)) {
+ 					ctx.ui.notify(`[multimodal-proxy] Consent not granted for ${descConfig.provider}. Use /multimodal-proxy consent yes.`, "warning");
+ 					return;
+ 				}
+@@ -2350,7 +2363,7 @@ export default function (pi: ExtensionAPI) {
+ 				`Max images/call: ${effective.maxImagesPerCall}\n` +
+ 				`Max batch: ${effective.maxBatch}\n` +
+ 				`Cache size: ${effective.cacheSize}\n` +
+-				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}\n` +
++				`Consent: ${hasEffectiveConsent(entries, effective.provider, effective) ? "granted" : "not granted"}\n` +
+ 				(env.mode || env.model || env.context
+ 					? `Env overrides: ${[env.mode && "mode", env.model && "model", env.context && "context", env.tool && "tool", env.maxImagesPerCall && "maxImagesPerCall", env.maxBatch && "maxBatch", env.cacheSize && "cacheSize", env.videoModel && "videoModel"]
+ 							.filter(Boolean)
+@@ -2374,7 +2387,7 @@ export default function (pi: ExtensionAPI) {
+ 				`Max images/call: ${effective.maxImagesPerCall}`,
+ 				`Max batch: ${effective.maxBatch}`,
+ 				`Cache size: ${effective.cacheSize}`,
+-				`Consent: ${hasConsent(entries, effective.provider) ? "granted" : "not granted"}`,
++				`Consent: ${hasEffectiveConsent(entries, effective.provider, effective) ? "granted" : "not granted"}`,
+ 			]);
+ 
+ 			if (!choice) return;
+@@ -2474,7 +2487,7 @@ export default function (pi: ExtensionAPI) {
+ 			}
+ 
+ 			if (choice.startsWith("Consent")) {
+-				const granted = !hasConsent(entries, effective.provider);
++				const granted = !hasEffectiveConsent(entries, effective.provider, effective);
+ 				pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted, provider: effective.provider });
+ 				ctx.ui.notify(`Consent: ${granted ? "granted" : "revoked"}`, granted ? "info" : "warning");
+ 				return;

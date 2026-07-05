@@ -38,6 +38,10 @@ interface Props {
   onOpenPath?: (filePath: string, action: OpenPathAction) => void;
 }
 
+const USER_MESSAGE_COLLAPSE_CHAR_LIMIT = 1200;
+const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 18;
+const USER_MESSAGE_PREVIEW_CHAR_LIMIT = 1000;
+
 function formatTime(ts?: number): string | null {
   if (!ts) return null;
   const d = new Date(ts);
@@ -157,6 +161,16 @@ function extractFileRefs(text: string): { text: string; files: string[] } {
   };
 }
 
+const IMAGE_FILE_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|avif|heic|heif|tiff?)$/i;
+
+function isPiWebHiddenAttachment(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/");
+  if (!IMAGE_FILE_EXT_RE.test(normalized)) return false;
+  return /\/\.pi\/agent\/web-attachments\//.test(normalized)
+    || /\/var\/folders\/[^/]+\/[^/]+\/T\/codex-clipboard-[^/]+$/i.test(normalized)
+    || /^\/tmp\/codex-clipboard-[^/]+$/i.test(normalized);
+}
+
 function normalizeStandalonePathLine(line: string): string | null {
   let value = line.trim();
   if (!value) return null;
@@ -193,6 +207,19 @@ function extractStandaloneFilePaths(text: string, hiddenFilePaths?: Set<string>)
   };
 }
 
+function shouldCollapseUserMessage(text: string): boolean {
+  if (text.length > USER_MESSAGE_COLLAPSE_CHAR_LIMIT) return true;
+  return text.split("\n").length > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+}
+
+function getCollapsedUserMessageText(text: string): string {
+  const lines = text.split("\n");
+  if (lines.length > USER_MESSAGE_COLLAPSE_LINE_LIMIT) {
+    return lines.slice(0, USER_MESSAGE_COLLAPSE_LINE_LIMIT).join("\n").trimEnd();
+  }
+  return text.slice(0, USER_MESSAGE_PREVIEW_CHAR_LIMIT).trimEnd();
+}
+
 function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, cwd, onPreviewFile, onOpenPath }: {
   message: UserMessage;
   entryId?: string;
@@ -207,6 +234,7 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
 }) {
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [expandedLongContent, setExpandedLongContent] = useState(false);
 
   const rawContent =
     typeof message.content === "string"
@@ -217,7 +245,12 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
           .join("\n");
   const parsedContent = useMemo(() => extractFileRefs(rawContent), [rawContent]);
   const content = parsedContent.text;
-  const attachedFilePaths = parsedContent.files;
+  const attachedFilePaths = parsedContent.files.filter((filePath) => !isPiWebHiddenAttachment(filePath));
+  const hiddenAttachedFileCount = parsedContent.files.length - attachedFilePaths.length;
+  const contentIsCollapsible = content ? shouldCollapseUserMessage(content) : false;
+  const displayedContent = contentIsCollapsible && !expandedLongContent
+    ? getCollapsedUserMessageText(content)
+    : content;
 
   const imageBlocks: ImageContent[] =
     typeof message.content === "string"
@@ -227,6 +260,10 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
   const time = formatTime(message.timestamp);
   const canFork = !!entryId && !!onFork;
   const canNavigate = !!prevAssistantEntryId && !!onNavigate;
+
+  useEffect(() => {
+    setExpandedLongContent(false);
+  }, [content]);
 
   const copyContent = () => {
     copyText(content).then(() => {
@@ -247,13 +284,14 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
             flex: 1,
             minWidth: 0,
             background: "var(--user-bg)",
-            border: "1px solid rgba(59,130,246,0.2)",
-            borderRadius: 12,
+            border: "1px solid var(--user-border)",
+            borderRadius: "var(--message-radius)",
             padding: "8px 12px",
             fontSize: 14,
             lineHeight: 1.6,
             color: "var(--text)",
             wordBreak: "break-word",
+            boxShadow: "var(--bubble-shadow)",
           }}
         >
           {imageBlocks.length > 0 && (
@@ -273,13 +311,42 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
                     key={i}
                     src={src}
                     alt=""
-                    style={{ maxWidth: 240, maxHeight: 240, borderRadius: 6, objectFit: "contain", display: "block", border: "1px solid rgba(59,130,246,0.15)" }}
+                    style={{ maxWidth: 240, maxHeight: 240, borderRadius: "calc(var(--message-radius) - 6px)", objectFit: "contain", display: "block", border: "1px solid var(--user-border)" }}
                   />
                 );
               })}
             </div>
           )}
-          {content && <MarkdownBody className="markdown-user-message">{content}</MarkdownBody>}
+          {content && (
+            <>
+              <MarkdownBody className="markdown-user-message">{displayedContent}</MarkdownBody>
+              {contentIsCollapsible && (
+                <button
+                  type="button"
+                  onClick={() => setExpandedLongContent((value) => !value)}
+                  style={{
+                    marginTop: 8,
+                    height: 26,
+                    padding: "0 9px",
+                    border: "1px solid var(--user-border)",
+                    borderRadius: "var(--control-radius)",
+                    background: "color-mix(in srgb, var(--accent) 8%, transparent)",
+                    color: "var(--accent)",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  }}
+                >
+                  {expandedLongContent ? "Collapse" : "Show full message"}
+                </button>
+              )}
+            </>
+          )}
+          {!content && imageBlocks.length === 0 && hiddenAttachedFileCount > 0 && (
+            <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+              {hiddenAttachedFileCount === 1 ? "Image attached" : `${hiddenAttachedFileCount} images attached`}
+            </span>
+          )}
           <AttachedFileCards
             files={attachedFilePaths}
             cwd={cwd}
@@ -756,7 +823,7 @@ function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?:
     <div
       style={{
         border: "1px solid var(--border)",
-        borderRadius: 6,
+        borderRadius: "var(--content-radius)",
         overflow: "hidden",
         fontSize: 13,
       }}
@@ -816,11 +883,11 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
   return (
     <div
       style={{
-        borderRadius: 7,
+        borderRadius: "var(--content-radius)",
         overflow: "hidden",
         fontSize: 12,
         border: isError ? "1px solid rgba(248,113,113,0.45)" : "1px solid rgba(34,197,94,0.25)",
-        background: isError ? "rgba(248,113,113,0.05)" : "rgba(34,197,94,0.04)",
+        background: isError ? "rgba(248,113,113,0.05)" : "var(--tool-bg)",
       }}
     >
       {/* ── Tool call header ── */}
@@ -908,7 +975,7 @@ function PairedResult({ text, isEmpty, isError }: {
           lineHeight: 1.5,
           overflow: "auto",
           maxHeight: 400,
-          background: "var(--bg)",
+          background: "var(--assistant-bg)",
           whiteSpace: "pre-wrap",
           wordBreak: "break-all",
           fontStyle: isEmpty ? "italic" : "normal",
@@ -945,9 +1012,9 @@ function CustomMessageView({ message }: { message: CustomMessage }) {
       <div
         style={{
           border: "1px solid var(--border)",
-          borderRadius: 8,
+          borderRadius: "var(--content-radius)",
           overflow: "hidden",
-          background: isHiddenDisplay ? "var(--bg-subtle)" : "var(--bg)",
+          background: isHiddenDisplay ? "var(--bg-subtle)" : "var(--assistant-bg)",
           opacity: isHiddenDisplay && !contentExpanded ? 0.82 : 1,
         }}
       >

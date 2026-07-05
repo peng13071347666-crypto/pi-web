@@ -1,7 +1,10 @@
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "crypto";
+import { existsSync } from "fs";
+import { createRequire } from "module";
+import { dirname, join, resolve } from "path";
 import { cacheSessionPath } from "./session-reader";
-import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { LoadExtensionsResult, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "./types";
 
@@ -28,6 +31,42 @@ type ExtensionUiRequestBody = Record<string, unknown> & {
 };
 
 const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const requireFromHere = createRequire(import.meta.url);
+const LEGACY_VISION_PROXY_EXTENSION = "vision-proxy.ts";
+const MULTIMODAL_PROXY_EXTENSION_PARTS = ["extensions", "vision-proxy.ts"];
+
+function resolveBundledPackageFile(packageName: string, parts: string[]): string | null {
+  const candidates: string[] = [];
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    candidates.push(join(dir, "node_modules", packageName, ...parts));
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  try {
+    const pkgPath = requireFromHere.resolve(`${packageName}/package.json`);
+    candidates.push(join(dirname(pkgPath), ...parts));
+  } catch {
+    // Manual search above covers local dev; this is only a production fallback.
+  }
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function isLegacyVisionProxyPath(filePath: string, agentDir: string): boolean {
+  return resolve(filePath) === resolve(join(agentDir, "extensions", LEGACY_VISION_PROXY_EXTENSION));
+}
+
+function loadPiWebExtensions(base: LoadExtensionsResult, agentDir: string): LoadExtensionsResult {
+  return {
+    ...base,
+    extensions: base.extensions.filter((extension) => (
+      !isLegacyVisionProxyPath(extension.path, agentDir)
+      && !isLegacyVisionProxyPath(extension.resolvedPath, agentDir)
+    )),
+    errors: base.errors.filter((error) => !isLegacyVisionProxyPath(error.path, agentDir)),
+  };
+}
 
 function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
   if (toolNames.length === 0) return [];
@@ -563,6 +602,16 @@ export async function startRpcSession(
   const starting = (async () => {
     const { SessionManager, getAgentDir } = await import("@earendil-works/pi-coding-agent");
     const agentDir = getAgentDir();
+    const settingsManager = SettingsManager.create(cwd, agentDir);
+    const multimodalProxyExtension = resolveBundledPackageFile("pi-multimodal-proxy", MULTIMODAL_PROXY_EXTENSION_PARTS);
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      ...(multimodalProxyExtension ? { additionalExtensionPaths: [multimodalProxyExtension] } : {}),
+      extensionsOverride: (base) => loadPiWebExtensions(base, agentDir),
+    });
+    await resourceLoader.reload();
 
     const sessionManager = sessionFile
       ? SessionManager.open(sessionFile, undefined)
@@ -585,6 +634,8 @@ export async function startRpcSession(
     const { session: inner } = await createAgentSession({
       cwd,
       agentDir,
+      settingsManager,
+      resourceLoader,
       sessionManager,
       ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
     });

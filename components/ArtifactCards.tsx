@@ -1,9 +1,9 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import dynamic from "next/dynamic";
 import type { ArtifactItem } from "@/lib/types";
 import { getFileIcon } from "./FileIcons";
-import { DiffView } from "./FileViewer";
 import { getFileName, getRelativeFilePath } from "@/lib/file-paths";
 
 export type OpenPathAction = "open" | "openFolder";
@@ -25,6 +25,15 @@ interface AttachedFileCardsProps {
 }
 
 const MEDIA_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "pdf", "docx", "html", "htm"]);
+
+const DiffView = dynamic(() => import("./FileViewer").then((mod) => mod.DiffView), {
+  ssr: false,
+  loading: () => (
+    <div style={{ padding: 10, color: "var(--text-dim)", fontSize: 12 }}>
+      Loading diff...
+    </div>
+  ),
+});
 
 function getExt(filePath: string): string {
   const name = getFileName(filePath).toLowerCase();
