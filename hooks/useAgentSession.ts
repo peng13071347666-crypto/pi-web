@@ -481,7 +481,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
   const initialScrollDoneRef = useRef(false);
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
+  const currentAssistantMsgRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToUserRef = useRef(false);
+  const pendingScrollToAssistantRef = useRef(false);
   const completionScrollAllowedRef = useRef(true);
   const userScrollIntentUntilRef = useRef(0);
   const ignoreProgrammaticScrollUntilRef = useRef(0);
@@ -1156,6 +1158,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentRunning(false);
       setAgentPhase(null);
       setRetryInfo(null);
+      pendingScrollToAssistantRef.current = true;
       dispatch({ type: "end" });
       onAgentEnd?.();
     }
@@ -1224,12 +1227,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setAgentRunning(false);
         setAgentPhase(null);
         setRetryInfo(null);
+        pendingScrollToAssistantRef.current = true;
         dispatch({ type: "end" });
         if (sessionIdRef.current) {
           const sid = sessionIdRef.current;
-          loadSession(sid, false, false, true).then((loaded) => {
+          loadSession(sid, false, false, true).then(async (loaded) => {
             const leafId = loaded?.leafId ?? sessionDetailCache.get(sid)?.data.leafId ?? activeLeafId;
-            void loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+            await loadContext(sid, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+            pendingScrollToAssistantRef.current = true;
           });
           fetch(`/api/agent/${encodeURIComponent(sessionIdRef.current)}`)
             .then((r) => r.json())
@@ -1270,6 +1275,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (completed && completed.role !== "user") {
           const normalized = normalizeToolCalls(completed);
           trackArtifactsFromMessage(normalized);
+          pendingScrollToAssistantRef.current = true;
           setMessages((prev) => {
             const currentSignature = assistantContentSignature(normalized);
             const previousSignature = prev.length ? assistantContentSignature(prev[prev.length - 1]) : null;
@@ -1367,6 +1373,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setAgentPhase(isSlashCommandPrompt ? { kind: "running_command" } : { kind: "waiting_model" });
     dispatch({ type: "start" });
     pendingScrollToUserRef.current = true;
+    pendingScrollToAssistantRef.current = false;
     completionScrollAllowedRef.current = true;
 
     const shouldSendRawImages = activeModelSupportsImages || hiddenImageFiles.length === 0;
@@ -1740,6 +1747,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     container.scrollTo({ top: elAbsTop - 16, behavior: "smooth" });
   }, []);
 
+  const scrollAssistantMsgToTop = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const container = scrollContainerRef.current;
+    const el = currentAssistantMsgRef.current;
+    if (!container || !el) return;
+    const elAbsTop = el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+    ignoreProgrammaticScrollUntilRef.current = Date.now() + PROGRAMMATIC_SCROLL_IGNORE_MS;
+    container.scrollTo({ top: Math.max(0, elAbsTop - 16), behavior });
+  }, []);
+
   const markUserScrollIntent = useCallback((event: Event) => {
     if (event instanceof KeyboardEvent) {
       if (!SCROLL_KEYS.has(event.key)) return;
@@ -1833,11 +1849,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       } else if (!initialScrollDoneRef.current) {
         initialScrollDoneRef.current = true;
         scrollToBottom("instant");
+      } else if (!agentRunningRef.current && pendingScrollToAssistantRef.current) {
+        pendingScrollToAssistantRef.current = false;
+        if (completionScrollAllowedRef.current) {
+          scrollAssistantMsgToTop("smooth");
+        }
       } else if (!agentRunningRef.current && completionScrollAllowedRef.current) {
         scrollToBottom("smooth");
       }
     }
-  }, [messages.length, agentRunning, scrollToBottom, scrollUserMsgToTop]);
+  }, [messages.length, agentRunning, scrollAssistantMsgToTop, scrollToBottom, scrollUserMsgToTop]);
 
   // Load model list
   useEffect(() => {
@@ -1914,7 +1935,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isNew,
     // Refs
     sessionIdRef, eventSourceRef, messagesEndRef, scrollContainerRef,
-    lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,
+    lastUserMsgRef, currentAssistantMsgRef, pendingScrollToUserRef, pendingScrollToAssistantRef, initialScrollDoneRef,
     // Actions
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,

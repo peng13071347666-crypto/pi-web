@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentMessage, ArtifactItem, ExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
@@ -70,6 +70,12 @@ const CHAT_MINIMAP_WIDTH = 36;
 const CHAT_COLUMN_PADDING = 16;
 const CHAT_INPUT_RIGHT_PADDING = CHAT_COLUMN_PADDING + CHAT_MINIMAP_WIDTH;
 
+function getMessageKey(msg: AgentMessage, entryId: string | undefined, idx: number): string {
+  if (entryId) return `entry:${entryId}`;
+  const timestamp = (msg as AgentMessage & { timestamp?: number }).timestamp ?? "no-time";
+  return `local:${msg.role}:${timestamp}:${idx}`;
+}
+
 function Typewriter({ phrases }: { phrases: string[] }) {
   const [phraseIdx, setPhraseIdx] = useState(() => Math.floor(Math.random() * phrases.length));
   const [text, setText] = useState("");
@@ -117,7 +123,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     hasMoreBefore, loadingMoreContext, artifacts,
     isNew,
     messagesEndRef, scrollContainerRef,
-    lastUserMsgRef,
+    lastUserMsgRef, currentAssistantMsgRef,
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleBuiltinSlashCommand,
@@ -191,7 +197,17 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   const { isDragOver, handleDragEnter, handleDragOver, handleDragLeave, handleDrop } = useDragDrop(onDrop);
 
   const visibleMessages = messages.filter((m) => m.role === "user" || m.role === "assistant");
-  const messageRefs = useMessageRefs(visibleMessages.length);
+  const streamingMessageIsVisible = streamState.streamingMessage?.role === "user" || streamState.streamingMessage?.role === "assistant";
+  const messageRefs = useMessageRefs(visibleMessages.length + (streamingMessageIsVisible ? 1 : 0));
+  const toolResultsMap = useMemo(() => {
+    const map = new Map<string, import("@/lib/types").ToolResultMessage>();
+    for (const msg of messages) {
+      if (msg.role === "toolResult") {
+        map.set((msg as import("@/lib/types").ToolResultMessage).toolCallId, msg as import("@/lib/types").ToolResultMessage);
+      }
+    }
+    return map;
+  }, [messages]);
 
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !agentRunning;
 
@@ -386,18 +402,20 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               )}
 
             {(() => {
-              const toolResultsMap = new Map<string, import("@/lib/types").ToolResultMessage>();
-              for (const msg of messages) {
-                if (msg.role === "toolResult") {
-                  toolResultsMap.set((msg as import("@/lib/types").ToolResultMessage).toolCallId, msg as import("@/lib/types").ToolResultMessage);
-                }
-              }
               let lastUserIdx = -1;
               for (let i = messages.length - 1; i >= 0; i--) {
                 if (messages[i].role === "user") { lastUserIdx = i; break; }
               }
+              let answerStartAssistantIdx = -1;
+              for (let i = Math.max(0, lastUserIdx + 1); i < messages.length; i++) {
+                if (messages[i].role === "assistant") {
+                  answerStartAssistantIdx = i;
+                  break;
+                }
+              }
               let refIdx = 0;
               return messages.map((msg, idx) => {
+                const key = getMessageKey(msg, entryIds[idx], idx);
                 const prevAssistantEntryId =
                   msg.role === "user" && idx > 0 && messages[idx - 1].role === "assistant"
                     ? entryIds[idx - 1]
@@ -422,7 +440,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 }
                 const view = (
                   <MessageView
-                    key={idx}
+                    key={key}
                     message={msg}
                     toolResults={toolResultsMap}
                     modelNames={modelNames}
@@ -444,9 +462,10 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 );
                 if (!isVisible) return view;
                 return (
-                  <div key={idx} ref={(el) => {
+                  <div key={key} ref={(el) => {
                     messageRefs.current[currentRefIdx] = el;
                     if (idx === lastUserIdx) { (lastUserMsgRef as { current: HTMLDivElement | null }).current = el; }
+                    if (idx === answerStartAssistantIdx) { (currentAssistantMsgRef as { current: HTMLDivElement | null }).current = el; }
                   }} style={{ contentVisibility: "auto", containIntrinsicSize: "220px" }}>
                     {view}
                   </div>
@@ -455,17 +474,29 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
             })()}
 
             {streamState.isStreaming && streamState.streamingMessage && (
-              <MessageView
-                message={streamState.streamingMessage as AgentMessage}
-                isStreaming
-                modelNames={modelNames}
-                artifacts={artifacts}
-                cwd={session?.cwd ?? newSessionCwd ?? undefined}
-                onPreviewArtifact={onArtifactPreviewRequest}
-                onReviewArtifacts={onReviewArtifactsRequest}
-                onPreviewFile={onFilePreviewRequest}
-                onOpenPath={onOpenPathRequest}
-              />
+              <div
+                ref={(el) => {
+                  if (streamingMessageIsVisible) {
+                    messageRefs.current[visibleMessages.length] = el;
+                  }
+                  if (streamState.streamingMessage?.role === "assistant") {
+                    (currentAssistantMsgRef as { current: HTMLDivElement | null }).current = el;
+                  }
+                }}
+                style={{ contentVisibility: "auto", containIntrinsicSize: "220px" }}
+              >
+                <MessageView
+                  message={streamState.streamingMessage as AgentMessage}
+                  isStreaming
+                  modelNames={modelNames}
+                  artifacts={artifacts}
+                  cwd={session?.cwd ?? newSessionCwd ?? undefined}
+                  onPreviewArtifact={onArtifactPreviewRequest}
+                  onReviewArtifacts={onReviewArtifactsRequest}
+                  onPreviewFile={onFilePreviewRequest}
+                  onOpenPath={onOpenPathRequest}
+                />
+              </div>
             )}
 
             {agentRunning && !streamState.streamingMessage && (

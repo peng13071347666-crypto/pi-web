@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ComponentType, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { useTheme } from "@/hooks/useTheme";
 import { markdownRehypePlugins, markdownRemarkPlugins } from "@/lib/markdown";
@@ -18,10 +18,15 @@ interface SyntaxHighlighterBodyProps {
 }
 
 let syntaxHighlighterBodyPromise: Promise<ComponentType<SyntaxHighlighterBodyProps>> | null = null;
+let syntaxHighlighterBodyComponent: ComponentType<SyntaxHighlighterBodyProps> | null = null;
 
 function loadSyntaxHighlighterBody(): Promise<ComponentType<SyntaxHighlighterBodyProps>> {
+  if (syntaxHighlighterBodyComponent) return Promise.resolve(syntaxHighlighterBodyComponent);
   if (!syntaxHighlighterBodyPromise) {
-    syntaxHighlighterBodyPromise = import("./SyntaxHighlighterBody").then((mod) => mod.SyntaxHighlighterBody);
+    syntaxHighlighterBodyPromise = import("./SyntaxHighlighterBody").then((mod) => {
+      syntaxHighlighterBodyComponent = mod.SyntaxHighlighterBody;
+      return mod.SyntaxHighlighterBody;
+    });
   }
   return syntaxHighlighterBodyPromise;
 }
@@ -45,51 +50,54 @@ function copyText(text: string): Promise<void> {
   }
 }
 
-export function MarkdownBody({ children, className, isStreaming }: MarkdownBodyProps) {
+function MarkdownBodyComponent({ children, className, isStreaming }: MarkdownBodyProps) {
   const normalizedMarkdown = useMemo(() => normalizeDisplayMath(children), [children]);
+  const markdownComponents = useMemo(() => ({
+    code({ className, children, ...props }: { className?: string; children?: ReactNode }) {
+      const lang = className?.replace("language-", "").toLowerCase() ?? "";
+      const raw = String(children);
+      const isBlock = className?.includes("language-") || raw.includes("\n");
+      if (isBlock) {
+        if (lang === "mermaid") {
+          return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={isStreaming} />;
+        }
+        return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
+      }
+      return (
+        <code
+          className="markdown-inline-code"
+          {...props}
+        >
+          {children}
+        </code>
+      );
+    },
+    pre({ children }: { children?: ReactNode }) {
+      return <>{children}</>;
+    },
+    table({ children }: { children?: ReactNode }) {
+      return (
+        <div className="markdown-table-wrap">
+          <table>{children}</table>
+        </div>
+      );
+    },
+  }), [isStreaming]);
 
   return (
     <div className={["markdown-body", className].filter(Boolean).join(" ")}>
       <ReactMarkdown
         remarkPlugins={markdownRemarkPlugins}
         rehypePlugins={markdownRehypePlugins}
-        components={{
-          code({ className, children, ...props }) {
-            const lang = className?.replace("language-", "").toLowerCase() ?? "";
-            const raw = String(children);
-            const isBlock = className?.includes("language-") || raw.includes("\n");
-            if (isBlock) {
-              if (lang === "mermaid") {
-                return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={isStreaming} />;
-              }
-              return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
-            }
-            return (
-              <code
-                className="markdown-inline-code"
-                {...props}
-              >
-                {children}
-              </code>
-            );
-          },
-          pre({ children }) {
-            return <>{children}</>;
-          },
-          table({ children }) {
-            return (
-              <div className="markdown-table-wrap">
-                <table>{children}</table>
-              </div>
-            );
-          },
-        }}
+        components={markdownComponents}
       >
         {normalizedMarkdown}
       </ReactMarkdown>
     </div>
   );
 }
+
+export const MarkdownBody = memo(MarkdownBodyComponent);
 
 function normalizeDisplayMath(markdown: string): string {
   const lineBreak = markdown.includes("\r\n") ? "\r\n" : "\n";
@@ -207,9 +215,10 @@ function MermaidBlock({ code, isStreaming }: { code: string; isStreaming?: boole
 function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; headerAction?: ReactNode }) {
   const { isDark } = useTheme();
   const [copied, setCopied] = useState(false);
-  const [SyntaxBody, setSyntaxBody] = useState<ComponentType<SyntaxHighlighterBodyProps> | null>(null);
+  const [SyntaxBody, setSyntaxBody] = useState<ComponentType<SyntaxHighlighterBodyProps> | null>(() => syntaxHighlighterBodyComponent);
 
   useEffect(() => {
+    if (SyntaxBody) return;
     let cancelled = false;
     loadSyntaxHighlighterBody().then((component) => {
       if (!cancelled) setSyntaxBody(() => component);
@@ -217,7 +226,7 @@ function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; h
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [SyntaxBody]);
 
   const copy = () => {
     copyText(code).then(() => {

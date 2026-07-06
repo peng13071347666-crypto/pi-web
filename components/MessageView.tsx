@@ -549,6 +549,10 @@ function AssistantMessageView({
       (artifact.toolCallId && callIds.has(artifact.toolCallId)) || callIds.has(artifact.id)
     ));
   }, [artifacts, blocks]);
+  const hiddenArtifactPaths = useMemo(
+    () => new Set(messageArtifacts.map((artifact) => artifact.filePath)),
+    [messageArtifacts]
+  );
 
   const copyContent = () => {
     copyText(textContent).then(() => {
@@ -674,7 +678,7 @@ function AssistantMessageView({
             isStreaming={isStreaming}
             streamingDuration={streamingDurations.get(i) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
             toolCallDurations={toolCallDurations}
-            hiddenFilePaths={new Set(messageArtifacts.map((artifact) => artifact.filePath))}
+            hiddenFilePaths={hiddenArtifactPaths}
             cwd={cwd}
             onPreviewFile={onPreviewFile}
             onOpenPath={onOpenPath}
