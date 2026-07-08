@@ -64,3 +64,10 @@ index 18c2045..73771f9 100644
  		ctx.ui.notify(
  			`[multimodal-proxy] "${visionModel.name ?? modelLabel(config)}" doesn't support images!`,
  			"error",
+@@ -1072,5 +1064,1 @@ async function handleAnalyzeImage(
+-	// Check consent for the resolved vision provider
+-	const entries = ctx.sessionManager.getEntries();
+-	if (!hasConsent(entries, visionProvider)) {
+-		return `Error: consent required before sending data to ${visionProvider}. Please tell the user to run the following command and then retry:\n\n/multimodal-proxy consent yes`
+-	}
++	// Consent always granted - user explicitly opted out of the consent prompt.

@@ -34,6 +34,7 @@ const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"
 const requireFromHere = createRequire(import.meta.url);
 const LEGACY_VISION_PROXY_EXTENSION = "vision-proxy.ts";
 const MULTIMODAL_PROXY_EXTENSION_PARTS = ["extensions", "vision-proxy.ts"];
+const MULTIMODAL_PROXY_PACKAGE_RE = /^(?:npm:)?pi-(?:multimodal|vision)-proxy(?:@|$)/;
 
 function resolveBundledPackageFile(packageName: string, parts: string[]): string | null {
   const candidates: string[] = [];
@@ -66,6 +67,32 @@ function loadPiWebExtensions(base: LoadExtensionsResult, agentDir: string): Load
     )),
     errors: base.errors.filter((error) => !isLegacyVisionProxyPath(error.path, agentDir)),
   };
+}
+
+function packageSourceText(source: unknown): string | null {
+  if (typeof source === "string") return source.trim();
+  if (
+    source
+    && typeof source === "object"
+    && "source" in source
+    && typeof source.source === "string"
+  ) {
+    return source.source.trim();
+  }
+  return null;
+}
+
+function packageSourceLoadsExtensions(source: unknown): boolean {
+  if (!source || typeof source !== "object" || !("extensions" in source)) return true;
+  const extensions = source.extensions;
+  return !Array.isArray(extensions) || extensions.length > 0;
+}
+
+function hasConfiguredMultimodalProxyPackage(settingsManager: SettingsManager): boolean {
+  return settingsManager.getPackages().some((source) => {
+    const text = packageSourceText(source);
+    return Boolean(text && MULTIMODAL_PROXY_PACKAGE_RE.test(text) && packageSourceLoadsExtensions(source));
+  });
 }
 
 function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
@@ -603,7 +630,9 @@ export async function startRpcSession(
     const { SessionManager, getAgentDir } = await import("@earendil-works/pi-coding-agent");
     const agentDir = getAgentDir();
     const settingsManager = SettingsManager.create(cwd, agentDir);
-    const multimodalProxyExtension = resolveBundledPackageFile("pi-multimodal-proxy", MULTIMODAL_PROXY_EXTENSION_PARTS);
+    const multimodalProxyExtension = hasConfiguredMultimodalProxyPackage(settingsManager)
+      ? null
+      : resolveBundledPackageFile("pi-multimodal-proxy", MULTIMODAL_PROXY_EXTENSION_PARTS);
     const resourceLoader = new DefaultResourceLoader({
       cwd,
       agentDir,
