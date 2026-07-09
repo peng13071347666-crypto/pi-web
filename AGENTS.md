@@ -78,7 +78,11 @@ components/
 ### AgentSession lifecycle (`lib/rpc-manager.ts`)
 - One `AgentSessionWrapper` per session id, keyed in `globalThis.__piSessions`
 - `globalThis` survives Next.js hot-reload; plain module-level Map does not
-- Idle timeout: 10 minutes. Concurrent `startRpcSession()` calls share a single start Promise (`globalThis.__piStartLocks`)
+- **Runtime policy (optimize/runtime-v1)**: default max **3** live sessions (`PI_WEB_MAX_LIVE`, `0`=unlimited); idle dispose **3 min** (`PI_WEB_IDLE_MS`); busy (streaming/prompt/compact) never idle-killed; LRU-evict idle when over max
+- SSE (`/api/agent/[id]/events`) does **not** start a session unless `PI_WEB_SSE_AUTOSTART=1`
+- `destroy()` calls underlying `AgentSession.dispose()`
+- Concurrent `startRpcSession()` calls share a single start Promise (`globalThis.__piStartLocks`)
+- Rollback notes: `.rollback/optimize-runtime-v1/README.md`
 
 ### Fork must destroy the wrapper immediately
 `AgentSession.fork()` **mutates the wrapper's inner state in-place** — after fork, `inner.sessionId` is the *new* session's id. If the wrapper stays alive in the registry under the old id, the next request gets the already-forked state and subsequent forks produce a corrupt `parentSession` chain.

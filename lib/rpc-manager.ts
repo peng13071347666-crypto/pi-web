@@ -36,6 +36,29 @@ const LEGACY_VISION_PROXY_EXTENSION = "vision-proxy.ts";
 const MULTIMODAL_PROXY_EXTENSION_PARTS = ["extensions", "vision-proxy.ts"];
 const MULTIMODAL_PROXY_PACKAGE_RE = /^(?:npm:)?pi-(?:multimodal|vision)-proxy(?:@|$)/;
 
+// Runtime policy (self-use defaults). Override via env without code rollback:
+//   PI_WEB_MAX_LIVE=3     max concurrent live AgentSessions (0 = unlimited)
+//   PI_WEB_IDLE_MS=180000 idle dispose after N ms of no activity (default 3min)
+//   PI_WEB_SSE_AUTOSTART=1  restore old behavior: SSE connects create sessions
+function readPositiveInt(envName: string, fallback: number): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+const MAX_LIVE_SESSIONS = readPositiveInt("PI_WEB_MAX_LIVE", 3);
+const IDLE_TIMEOUT_MS = readPositiveInt("PI_WEB_IDLE_MS", 3 * 60 * 1000);
+const SSE_AUTOSTART = process.env.PI_WEB_SSE_AUTOSTART === "1";
+
+export function getRuntimePolicy() {
+  return {
+    maxLiveSessions: MAX_LIVE_SESSIONS,
+    idleTimeoutMs: IDLE_TIMEOUT_MS,
+    sseAutostart: SSE_AUTOSTART,
+  };
+}
+
 function resolveBundledPackageFile(packageName: string, parts: string[]): string | null {
   const candidates: string[] = [];
   let dir = process.cwd();
@@ -122,6 +145,8 @@ export class AgentSessionWrapper {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
   private _alive = true;
+  /** Last user/agent activity (not SSE heartbeats). Used for LRU eviction. */
+  lastActivityAt = Date.now();
 
   constructor(public readonly inner: AgentSessionLike) {
     this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
@@ -139,6 +164,10 @@ export class AgentSessionWrapper {
     return this._alive;
   }
 
+  isBusy(): boolean {
+    return this.promptRunning || this.inner.isStreaming || this.inner.isCompacting;
+  }
+
   async start(): Promise<void> {
     // Emit session_start to extensions (e.g. pi-multimodal-proxy reads config file)
     // Must happen before any events are processed, otherwise _fileConfig stays empty
@@ -150,19 +179,36 @@ export class AgentSessionWrapper {
       console.error("bindExtensions failed:", err);
     }
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
-      this.resetIdleTimer();
+      this.touchActivity();
       this.emit(event);
     });
-    this.resetIdleTimer();
+    this.touchActivity();
   }
 
   private emit(event: AgentEvent): void {
     for (const l of this.listeners) l(event);
   }
 
+  /** Mark activity (user command or agent event). Public for registry reuse. */
+  touchActivity(): void {
+    this.lastActivityAt = Date.now();
+    this.resetIdleTimer();
+  }
+
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => this.destroy(), 10 * 60 * 1000);
+    // Busy sessions stay alive; idle timer re-arms when activity stops via events.
+    if (this.isBusy()) {
+      this.idleTimer = setTimeout(() => this.resetIdleTimer(), Math.min(IDLE_TIMEOUT_MS, 30_000));
+      return;
+    }
+    this.idleTimer = setTimeout(() => {
+      if (this.isBusy()) {
+        this.resetIdleTimer();
+        return;
+      }
+      this.destroy();
+    }, IDLE_TIMEOUT_MS);
   }
 
   onEvent(listener: EventListener): () => void {
@@ -178,7 +224,7 @@ export class AgentSessionWrapper {
   }
 
   async send(command: Record<string, unknown>): Promise<unknown> {
-    this.resetIdleTimer();
+    this.touchActivity();
     const type = command.type as string;
 
     switch (type) {
@@ -400,9 +446,20 @@ export class AgentSessionWrapper {
     if (!this._alive) return;
     this._alive = false;
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = null;
     this.unsubscribe?.();
+    this.unsubscribe = null;
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
     this.pendingUiResponses.clear();
+    this.extensionStatuses.clear();
+    this.extensionWidgets.clear();
+    this.listeners = [];
+    // Best-effort teardown of the underlying AgentSession (same as leaving CLI).
+    try {
+      this.inner.dispose();
+    } catch {
+      // ignore dispose errors during teardown
+    }
     this.onDestroyCallback?.();
   }
 
@@ -606,6 +663,49 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
   return getRegistry().get(sessionId);
 }
 
+export function listLiveRpcSessions(): Array<{ sessionId: string; busy: boolean; lastActivityAt: number }> {
+  const out: Array<{ sessionId: string; busy: boolean; lastActivityAt: number }> = [];
+  for (const [sessionId, session] of getRegistry()) {
+    if (!session.isAlive()) continue;
+    out.push({
+      sessionId,
+      busy: session.isBusy(),
+      lastActivityAt: session.lastActivityAt,
+    });
+  }
+  return out;
+}
+
+export function releaseRpcSession(sessionId: string): boolean {
+  const session = getRegistry().get(sessionId);
+  if (!session?.isAlive()) return false;
+  session.destroy();
+  return true;
+}
+
+/**
+ * Evict idle sessions when over MAX_LIVE_SESSIONS.
+ * Never evicts busy (streaming / prompt / compacting) sessions.
+ * maxLive=0 means unlimited.
+ */
+function evictIfNeeded(keepSessionId?: string): void {
+  if (MAX_LIVE_SESSIONS <= 0) return;
+  const registry = getRegistry();
+  const live = [...registry.entries()].filter(([, s]) => s.isAlive());
+  if (live.length < MAX_LIVE_SESSIONS) return;
+
+  const victims = live
+    .filter(([id, s]) => id !== keepSessionId && !s.isBusy())
+    .sort((a, b) => a[1].lastActivityAt - b[1].lastActivityAt);
+
+  let overflow = live.length - MAX_LIVE_SESSIONS + 1; // make room for one new start
+  for (const [, session] of victims) {
+    if (overflow <= 0) break;
+    session.destroy();
+    overflow--;
+  }
+}
+
 /**
  * Get or create an AgentSession for the given session.
  * For new sessions (sessionFile === ""), pi generates its own id.
@@ -621,12 +721,17 @@ export async function startRpcSession(
   const locks = getLocks();
 
   const existing = registry.get(sessionId);
-  if (existing?.isAlive()) return { session: existing, realSessionId: sessionId };
+  if (existing?.isAlive()) {
+    existing.touchActivity();
+    return { session: existing, realSessionId: sessionId };
+  }
 
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
 
   const starting = (async () => {
+    evictIfNeeded(sessionId);
+
     const { SessionManager, getAgentDir } = await import("@earendil-works/pi-coding-agent");
     const agentDir = getAgentDir();
     const settingsManager = SettingsManager.create(cwd, agentDir);

@@ -167,9 +167,28 @@ const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
-const INITIAL_CONTEXT_LIMIT = 240;
-const CONTEXT_PAGE_LIMIT = 240;
+const INITIAL_CONTEXT_LIMIT = 80;
+const CONTEXT_PAGE_LIMIT = 80;
+const SESSION_DETAIL_CACHE_MAX = 15;
 const sessionDetailCache = new Map<string, SessionCacheEntry>();
+
+function putSessionDetailCache(sid: string, entry: SessionCacheEntry): void {
+  // LRU: re-insert moves to the end; evict oldest when over cap.
+  if (sessionDetailCache.has(sid)) sessionDetailCache.delete(sid);
+  sessionDetailCache.set(sid, entry);
+  while (sessionDetailCache.size > SESSION_DETAIL_CACHE_MAX) {
+    const oldest = sessionDetailCache.keys().next().value;
+    if (oldest === undefined) break;
+    sessionDetailCache.delete(oldest);
+  }
+}
+
+function touchSessionDetailCache(sid: string): void {
+  const entry = sessionDetailCache.get(sid);
+  if (!entry) return;
+  sessionDetailCache.delete(sid);
+  sessionDetailCache.set(sid, entry);
+}
 
 function createNoticeId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -559,6 +578,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   ) => {
     const requestId = ++loadSessionRequestRef.current;
     const cached = sessionDetailCache.get(sid);
+    if (cached) touchSessionDetailCache(sid);
     try {
       if (showLoading) {
         if (cached) {
@@ -623,7 +643,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setEntryIds(nextEntryIds);
       setHasMoreBefore(nextHasMoreBefore);
       setOldestEntryId(nextOldestEntryId);
-      sessionDetailCache.set(sid, {
+      putSessionDetailCache(sid, {
         data: nextData,
         messages: nextMessages,
         entryIds: nextEntryIds,
@@ -700,7 +720,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             entryIds: nextEntryIds,
           },
         };
-        sessionDetailCache.set(sid, {
+        putSessionDetailCache(sid, {
           data: nextData,
           messages: nextMessages,
           entryIds: nextEntryIds,
@@ -803,6 +823,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [ensureNewSession]);
 
+  /** Ensure server-side AgentSession is live without sending a user prompt. */
+  const warmAgentSession = useCallback(async (sid: string) => {
+    await sendAgentCommand(sid, { type: "get_state" });
+  }, []);
+
   const connectEvents = useCallback((sid: string): Promise<void> => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
@@ -825,6 +850,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         try {
           const event = JSON.parse(e.data) as AgentEvent;
           if (event.type === "connected") settle();
+          if (event.type === "idle") {
+            // Not live — do not reconnect-loop; caller should warm first.
+            settle();
+            if (eventSourceRef.current === es) {
+              es.close();
+              eventSourceRef.current = null;
+            }
+            return;
+          }
           handleAgentEventRef.current?.(event);
         } catch {
           // ignore
@@ -836,12 +870,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           es.close();
           eventSourceRef.current = null;
           setTimeout(() => {
-            if (agentRunningRef.current) void connectEvents(sid);
+            if (!agentRunningRef.current) return;
+            // Re-warm then reconnect so SSE never auto-starts a cold session alone.
+            void warmAgentSession(sid)
+              .then(() => connectEvents(sid))
+              .catch(() => {
+                /* session may have been deleted */
+              });
           }, 1000);
         }
       };
     });
-  }, []);
+  }, [warmAgentSession]);
+
+  /** Warm runtime, attach SSE, then ready for prompt/commands. */
+  const connectLive = useCallback(async (sid: string) => {
+    await warmAgentSession(sid);
+    await connectEvents(sid);
+  }, [warmAgentSession, connectEvents]);
 
   const respondToExtensionUi = useCallback(async (
     request: ExtensionUiDialogRequest,
@@ -1393,7 +1439,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             setPendingModel(selectedModel);
             await sendAgentCommand(existingSid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
           }
-          await connectEvents(existingSid);
+          await connectLive(existingSid);
           await sendAgentCommand(existingSid, {
             type: "prompt",
             message: messageForAgent,
@@ -1430,7 +1476,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       } else if (session) {
         sentSessionId = session.id;
-        await connectEvents(session.id);
+        await connectLive(session.id);
         await sendAgentCommand(session.id, {
           type: "prompt",
           message: messageForAgent,
@@ -1447,7 +1493,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [activeModelSupportsImages, addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, promoteNewSession, waitForPromptSettlement]);
+  }, [activeModelSupportsImages, addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, connectLive, promoteNewSession, waitForPromptSettlement]);
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
