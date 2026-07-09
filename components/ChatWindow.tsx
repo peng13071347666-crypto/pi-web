@@ -10,6 +10,7 @@ import { useAgentSession, type AgentPhase, type NoticeItem } from "@/hooks/useAg
 import { useAudio } from "@/hooks/useAudio";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import { phaseLabel as formatPhaseLabel } from "@/lib/ui-format";
 
 interface Props {
   session: SessionInfo | null;
@@ -32,17 +33,8 @@ interface Props {
   onOpenPathRequest?: (filePath: string, action: OpenPathAction) => void;
 }
 
-function phaseLabel(phase: AgentPhase): string {
-  if (phase?.kind === "running_tools") {
-    const names = phase.tools.map((t) => t.name);
-    if (names.length === 0) return "Running tool...";
-    if (names.length === 1) return `Running ${names[0]}...`;
-    if (names.length <= 3) return `Running ${names.join(", ")}...`;
-    return `Running ${names.slice(0, 2).join(", ")} (+${names.length - 2})...`;
-  }
-  if (phase?.kind === "waiting_model") return "Waiting for model...";
-  if (phase?.kind === "running_command") return "Running command...";
-  return "Thinking...";
+function phaseLabel(phase: AgentPhase, startedAt?: number | null): string {
+  return formatPhaseLabel(phase, { startedAt });
 }
 
 const TYPEWRITER_PHRASES = [
@@ -140,6 +132,39 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
   playDoneSoundRef.current = playDoneSound;
   const soundEnabledRef = useRef(soundEnabled);
   soundEnabledRef.current = soundEnabled;
+
+  // Track how long the current agent run has been active (for status bar).
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (agentRunning) {
+      setRunStartedAt((prev) => prev ?? Date.now());
+      const id = setInterval(() => setTick((n) => n + 1), 1000);
+      return () => clearInterval(id);
+    }
+    setRunStartedAt(null);
+  }, [agentRunning]);
+
+  // Esc aborts when agent is running (and focus is not in an editable field).
+  useEffect(() => {
+    if (!agentRunning) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        // Still allow Esc to abort from the main chat textarea.
+        if (t.tagName === "TEXTAREA" && t.closest("[data-pi-chat-input-shell]")) {
+          e.preventDefault();
+          void handleAbort();
+        }
+        return;
+      }
+      e.preventDefault();
+      void handleAbort();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [agentRunning, handleAbort]);
 
   // Wrap agent event handler to play sound on agent_end
   const origHandler = handleAgentEventRef.current;
@@ -351,6 +376,48 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 </span>
               </div>
             </div>
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 8,
+                margin: "0 16px 14px",
+              }}
+            >
+              {[
+                { label: "解释这个项目", text: "请先快速了解当前项目结构与技术栈，用中文简要说明。" },
+                { label: "找 bug / 修问题", text: "帮我排查当前最可能的问题，先给结论再给改法。" },
+                { label: "写/改代码", text: "按最小改动原则实现下面需求：" },
+              ].map((item) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  onClick={() => chatInputRef?.current?.insertIfEmpty(item.text)}
+                  style={{
+                    border: "1px solid var(--border)",
+                    background: "var(--bg-panel)",
+                    color: "var(--text-muted)",
+                    borderRadius: 999,
+                    padding: "6px 12px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = "var(--accent-border)";
+                    e.currentTarget.style.color = "var(--text)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = "var(--border)";
+                    e.currentTarget.style.color = "var(--text-muted)";
+                  }}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ margin: "0 16px 10px", fontSize: 11, color: "var(--text-dim)" }}>
+              Enter 发送 · Shift+Enter 换行 · Esc 中止 · / 命令
+            </div>
             <NoticeShelf notices={notices} align="right" />
             {chatInputElement}
           </div>
@@ -501,7 +568,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
 
             {agentRunning && !streamState.streamingMessage && (
               <div className="py-2 text-[13px] text-text-muted">
-                <span className="animate-[pulse_1.5s_infinite]">{phaseLabel(agentPhase)}</span>
+                <span className="animate-[pulse_1.5s_infinite]">{phaseLabel(agentPhase, runStartedAt)}</span>
               </div>
             )}
 
@@ -522,6 +589,30 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
       </div>
 
       <div className="relative">
+        {agentRunning && (
+          <div
+            style={{
+              padding: `0 ${CHAT_COLUMN_PADDING}px`,
+              paddingRight: CHAT_INPUT_RIGHT_PADDING,
+              marginBottom: 6,
+            }}
+          >
+            <div style={{ maxWidth: "var(--chat-max-width)", margin: "0 auto" }}>
+              <div className="pi-agent-status-bar">
+                <span className="pi-agent-status-dot" />
+                <span className="pi-agent-status-text">{phaseLabel(agentPhase, runStartedAt)}</span>
+                <span className="pi-agent-status-hint">Esc 中止</span>
+                <button
+                  type="button"
+                  onClick={() => void handleAbort()}
+                  className="pi-agent-status-stop"
+                >
+                  停止
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div
           style={{
             padding: `0 ${CHAT_COLUMN_PADDING}px`,

@@ -389,8 +389,14 @@ export function AppShell() {
     setArtifacts(nextArtifacts);
     const nextOutputArtifacts = nextArtifacts.filter((item) => item.kind === "created" || item.kind === "modified");
     setActiveArtifactId((current) => {
+      // Prefer the newest finished/pending output artifact so the panel tracks the latest result.
+      const newest = [...nextOutputArtifacts].reverse()[0];
+      if (newest && (!current || !nextOutputArtifacts.some((item) => item.id === current))) {
+        return newest.id;
+      }
+      // If current still exists but a newer done artifact appeared, stick with current unless user is on artifacts review.
       if (current && nextOutputArtifacts.some((item) => item.id === current)) return current;
-      return nextOutputArtifacts[0]?.id ?? null;
+      return newest?.id ?? null;
     });
   }, []);
 

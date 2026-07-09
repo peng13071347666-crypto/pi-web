@@ -213,6 +213,8 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [explorerKey, setExplorerKey] = useState(0);
   const [sessionRefreshDone, setSessionRefreshDone] = useState(false);
   const [explorerRefreshDone, setExplorerRefreshDone] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
+  const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(() => new Set());
   const sessionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const explorerRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -251,6 +253,28 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     fetch("/api/home").then((r) => r.json()).then((d: { home?: string }) => {
       if (d.home) setHomeDir(d.home);
     }).catch(() => {});
+  }, []);
+
+  // Poll live Agent sessions for sidebar dots (lightweight; fails silently).
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/agent/runtime");
+        if (!res.ok) return;
+        const data = await res.json() as { live?: Array<{ sessionId: string; busy?: boolean }> };
+        if (cancelled) return;
+        setLiveSessionIds(new Set((data.live ?? []).map((s) => s.sessionId)));
+      } catch {
+        // runtime endpoint may be unavailable on older instances
+      }
+    };
+    void poll();
+    const id = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
   const restoredRef = useRef(false);
@@ -350,11 +374,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     onNewSession?.(tempId, effectiveCwd);
   }, [effectiveCwd, onNewSession]);
 
-  const filteredSessions = selectedCwd
-    ? allSessions.filter((s) => s.cwd === selectedCwd)
-    : allSessions;
+  const filteredSessions = (() => {
+    const byCwd = selectedCwd
+      ? allSessions.filter((s) => s.cwd === selectedCwd)
+      : allSessions;
+    const q = sessionQuery.trim().toLowerCase();
+    if (!q) return byCwd;
+    return byCwd.filter((s) => {
+      const hay = `${s.name ?? ""} ${s.firstMessage ?? ""} ${s.id} ${s.cwd ?? ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  })();
 
-  // Build parent-child tree within the filtered set
+  // Build parent-child tree within the filtered set (already sorted by modified desc at each level)
   const sessionTree = buildSessionTree(filteredSessions);
 
   return (
@@ -716,11 +748,32 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         </div>
       </div>
 
+      {/* Session search */}
+      <div style={{ padding: "8px 10px 6px", flexShrink: 0 }}>
+        <input
+          value={sessionQuery}
+          onChange={(e) => setSessionQuery(e.target.value)}
+          placeholder="搜索会话…"
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            height: 30,
+            padding: "0 10px",
+            borderRadius: "var(--control-radius)",
+            border: "1px solid var(--border)",
+            background: "var(--input-bg)",
+            color: "var(--text)",
+            fontSize: 12,
+            outline: "none",
+          }}
+        />
+      </div>
+
       {/* Session list */}
       <div style={{ flex: explorerOpen && (selectedCwdProp || selectedCwd) ? "1 1 0" : "1 1 auto", overflowY: "auto", padding: "0", minHeight: 80 }}>
         {loading && (
           <div style={{ padding: "16px 14px", color: "var(--text-muted)", fontSize: 12 }}>
-            Loading...
+            加载中…
           </div>
         )}
         {error && (
@@ -730,7 +783,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         )}
         {!loading && !error && filteredSessions.length === 0 && (
           <div style={{ padding: "16px 14px", color: "var(--text-muted)", fontSize: 12 }}>
-            No sessions found
+            {sessionQuery.trim() ? "没有匹配的会话" : "暂无会话"}
+          </div>
+        )}
+        {!loading && !error && filteredSessions.length > 0 && (
+          <div style={{ padding: "4px 12px 6px", fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--text-dim)" }}>
+            {sessionQuery.trim() ? "搜索结果" : selectedCwd ? "本项目会话" : "全部会话"}
+            <span style={{ fontWeight: 500, marginLeft: 6, textTransform: "none", letterSpacing: 0 }}>{filteredSessions.length}</span>
+            {liveSessionIds.size > 0 && (
+              <span style={{ fontWeight: 500, marginLeft: 8, textTransform: "none", letterSpacing: 0, color: "var(--accent)" }}>
+                {liveSessionIds.size} live
+              </span>
+            )}
           </div>
         )}
         {sessionTree.map((node) => (
@@ -738,6 +802,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             key={node.session.id}
             node={node}
             selectedSessionId={selectedSessionId}
+            liveSessionIds={liveSessionIds}
             onSelectSession={onSelectSession}
             onRenamed={loadSessions}
             onSessionDeleted={(id) => {
@@ -843,6 +908,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
 function SessionTreeItem({
   node,
   selectedSessionId,
+  liveSessionIds,
   onSelectSession,
   onRenamed,
   onSessionDeleted,
@@ -850,6 +916,7 @@ function SessionTreeItem({
 }: {
   node: SessionTreeNode;
   selectedSessionId: string | null;
+  liveSessionIds: Set<string>;
   onSelectSession: (s: SessionInfo) => void;
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
@@ -875,6 +942,7 @@ function SessionTreeItem({
         <SessionItem
           session={node.session}
           isSelected={node.session.id === selectedSessionId}
+          isLive={liveSessionIds.has(node.session.id)}
           onClick={() => onSelectSession(node.session)}
           onRenamed={onRenamed}
           onDeleted={(id) => onSessionDeleted?.(id)}
@@ -891,6 +959,7 @@ function SessionTreeItem({
               key={child.session.id}
               node={child}
               selectedSessionId={selectedSessionId}
+              liveSessionIds={liveSessionIds}
               onSelectSession={onSelectSession}
               onRenamed={onRenamed}
               onSessionDeleted={onSessionDeleted}
@@ -906,6 +975,7 @@ function SessionTreeItem({
 function SessionItem({
   session,
   isSelected,
+  isLive = false,
   onClick,
   onRenamed,
   onDeleted,
@@ -916,6 +986,7 @@ function SessionItem({
 }: {
   session: SessionInfo;
   isSelected: boolean;
+  isLive?: boolean;
   onClick: () => void;
   onRenamed?: () => void;
   onDeleted?: (id: string) => void;
@@ -1092,14 +1163,31 @@ function SessionItem({
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
                 color: "var(--text)",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
               }}
               title={title}
             >
-              {title}
+              {isLive && (
+                <span
+                  title="Agent 运行中"
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    background: "var(--accent)",
+                    boxShadow: "0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent)",
+                    flexShrink: 0,
+                  }}
+                />
+              )}
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{title}</span>
             </div>
             <div style={{ marginTop: 2, display: "flex", gap: 8, color: "var(--text-dim)", fontSize: 11 }}>
               <span title={session.modified}>{formatRelativeTime(session.modified)}</span>
               <span>{session.messageCount} msgs</span>
+              {isLive && <span style={{ color: "var(--accent)" }}>live</span>}
             </div>
           </div>
 

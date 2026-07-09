@@ -163,6 +163,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [modelDropdownRect, setModelDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [slashActiveIndex, setSlashActiveIndex] = useState(0);
@@ -682,6 +684,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (thinkingDropdownRef.current && !thinkingDropdownRef.current.contains(e.target as Node)) {
         setThinkingDropdownOpen(false);
       }
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) {
+        setMoreOpen(false);
+      }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
@@ -1050,9 +1055,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             onPaste={handlePaste}
             placeholder={
               isStreaming && (onSteer || onFollowUp)
-                ? "Steer 立即注入 / Follow-up 排队…"
-                : isStreaming ? "Agent is running…"
-                : "Message… Type / for commands"
+                ? "Steer 立即注入 / Follow-up 排队…（Esc 中止）"
+                : isStreaming ? "Agent 运行中… Esc 中止"
+                : "发消息… Enter 发送 · / 命令"
             }
             rows={1}
             style={{
@@ -1460,61 +1465,27 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               </div>
             )}
 
-            {!isStreaming && onCompact && (
-              <div style={{ position: "relative" }}>
-                {compactError && (
-                  <div style={{
-                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
-                    background: "#1f2937", color: "#f87171",
-                    fontSize: 11, padding: "4px 8px", borderRadius: 5,
-                    whiteSpace: "nowrap", pointerEvents: "none",
-                    boxShadow: "0 2px 8px rgba(0,0,0,0.2)", zIndex: 50,
-                  }}>
-                    {compactError}
-                  </div>
-                )}
-                <button
-                  onClick={isCompacting ? onAbortCompaction : onCompact}
-                  disabled={isStreaming && !isCompacting}
-                  style={{
-                    display: "flex", alignItems: "center", gap: 5,
-                    padding: "8px 12px",
-                    height: 32,
-                    background: isCompacting ? "rgba(239,68,68,0.08)" : "none",
-                    border: "none",
-                    borderRadius: "var(--control-radius)",
-                    color: isCompacting ? "#ef4444" : "var(--text-muted)",
-                    cursor: (isStreaming && !isCompacting) ? "not-allowed" : "pointer",
-                    fontSize: 12, opacity: (isStreaming && !isCompacting) ? 0.5 : 1,
-                    transition: "background 0.12s, color 0.12s",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (isStreaming && !isCompacting) return;
-                    e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.16)" : "var(--bg-hover)";
-                    e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.08)" : "none";
-                    e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text-muted)";
-                  }}
-                  title={isCompacting ? "停止压缩" : "压缩上下文"}
-                >
-                  {isCompacting ? (
-                    <><svg width="10" height="10" viewBox="0 0 10 10" fill="none"><rect x="2" y="2" width="6" height="6" rx="1" fill="currentColor" /></svg>Compacting…</>
-                  ) : (
-                    <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="4 14 10 14 10 20" /><polyline points="20 10 14 10 14 4" />
-                      <line x1="10" y1="14" x2="3" y2="21" /><line x1="21" y1="3" x2="14" y2="10" />
-                    </svg>Compact</>
-                  )}
-                </button>
-              </div>
+            {/* Compact stays visible while running so user can abort compaction quickly */}
+            {isCompacting && onAbortCompaction && (
+              <button
+                type="button"
+                onClick={onAbortCompaction}
+                style={{
+                  display: "flex", alignItems: "center", gap: 5,
+                  padding: "8px 12px", height: 32,
+                  background: "rgba(239,68,68,0.08)", border: "none",
+                  borderRadius: "var(--control-radius)", color: "#ef4444",
+                  cursor: "pointer", fontSize: 12,
+                }}
+              >
+                停止压缩
+              </button>
             )}
 
             {isStreaming && (
               <button
                 onClick={onAbort}
-                title="停止 Agent"
+                title="停止 Agent（Esc）"
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   padding: "8px 14px",
@@ -1534,50 +1505,88 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
                   <rect x="1.5" y="1.5" width="7" height="7" rx="1.5" fill="currentColor" />
                 </svg>
-                Stop
+                停止
               </button>
             )}
 
-            {onSoundToggle !== undefined && (
-              <button
-                onClick={onSoundToggle}
-                title={soundEnabled ? "关闭完成提示音" : "开启完成提示音"}
-                style={{
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 32, height: 32, padding: 0,
-                  background: "none",
-                  border: "none",
-                  borderRadius: "var(--control-radius)",
-                  color: soundEnabled ? "var(--text-muted)" : "var(--text-dim)",
-                  cursor: "pointer",
-                  opacity: soundEnabled ? 1 : 0.55,
-                  transition: "background 0.12s, color 0.12s, opacity 0.12s",
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "var(--bg-hover)";
-                  e.currentTarget.style.color = "var(--text)";
-                  e.currentTarget.style.opacity = "1";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "none";
-                  e.currentTarget.style.color = soundEnabled ? "var(--text-muted)" : "var(--text-dim)";
-                  e.currentTarget.style.opacity = soundEnabled ? "1" : "0.55";
-                }}
-              >
-                {soundEnabled ? (
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                  </svg>
-                ) : (
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                    <line x1="23" y1="9" x2="17" y2="15" />
-                    <line x1="17" y1="9" x2="23" y2="15" />
-                  </svg>
+            {/* Secondary actions: compact / sound */}
+            {!isStreaming && (
+              <div ref={moreRef} style={{ position: "relative" }}>
+                {compactError && (
+                  <div style={{
+                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
+                    background: "#1f2937", color: "#f87171",
+                    fontSize: 11, padding: "4px 8px", borderRadius: 5,
+                    whiteSpace: "nowrap", pointerEvents: "none",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.2)", zIndex: 50,
+                  }}>
+                    {compactError}
+                  </div>
                 )}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setMoreOpen((v) => !v)}
+                  title="更多"
+                  style={{
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    width: 32, height: 32, padding: 0,
+                    background: moreOpen ? "var(--bg-hover)" : "none",
+                    border: "none",
+                    borderRadius: "var(--control-radius)",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="5" cy="12" r="1.6" />
+                    <circle cx="12" cy="12" r="1.6" />
+                    <circle cx="19" cy="12" r="1.6" />
+                  </svg>
+                </button>
+                {moreOpen && (
+                  <div style={{
+                    position: "absolute", bottom: "calc(100% + 6px)", right: 0,
+                    zIndex: 100, minWidth: 160,
+                    background: "var(--popover-bg)", border: "1px solid var(--border)",
+                    borderRadius: "var(--popover-radius)", boxShadow: "var(--popover-shadow)",
+                    overflow: "hidden",
+                  }}>
+                    {onCompact && (
+                      <button
+                        type="button"
+                        onClick={() => { setMoreOpen(false); onCompact(); }}
+                        style={{
+                          display: "block", width: "100%", textAlign: "left",
+                          padding: "8px 12px", border: "none", background: "none",
+                          color: "var(--text-muted)", fontSize: 12, cursor: "pointer",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "none"; }}
+                      >
+                        压缩上下文 Compact
+                      </button>
+                    )}
+                    {onSoundToggle !== undefined && (
+                      <button
+                        type="button"
+                        onClick={() => { onSoundToggle(); }}
+                        style={{
+                          display: "block", width: "100%", textAlign: "left",
+                          padding: "8px 12px", border: "none", background: "none",
+                          color: "var(--text-muted)", fontSize: 12, cursor: "pointer",
+                        }}
+                        onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.background = "none"; }}
+                      >
+                        {soundEnabled ? "关闭完成提示音" : "开启完成提示音"}
+                      </button>
+                    )}
+                    <div style={{ padding: "6px 12px 8px", fontSize: 10, color: "var(--text-dim)", borderTop: "1px solid var(--border)" }}>
+                      Enter 发送 · Esc 中止
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
           </div>
 

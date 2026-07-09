@@ -15,10 +15,10 @@ interface Props {
 }
 
 function kindLabel(kind: ArtifactItem["kind"]): string {
-  if (kind === "created") return "Created";
-  if (kind === "modified") return "Modified";
-  if (kind === "read") return "Read";
-  return "Changed";
+  if (kind === "created") return "新建";
+  if (kind === "modified") return "修改";
+  if (kind === "read") return "读取";
+  return "变更";
 }
 
 function statusColor(status: ArtifactItem["status"]): string {
@@ -29,21 +29,28 @@ function statusColor(status: ArtifactItem["status"]): string {
 
 export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtifact, onOpenPath }: Props) {
   const outputArtifacts = artifacts.filter((item) => item.kind === "created" || item.kind === "modified");
-  const active = outputArtifacts.find((item) => item.id === activeArtifactId) ?? outputArtifacts[0] ?? null;
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
 
   if (outputArtifacts.length === 0) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-dim)", fontSize: 12 }}>
-        No artifacts yet
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, color: "var(--text-dim)", fontSize: 12, padding: 16, textAlign: "center" }}>
+        <div style={{ fontWeight: 600, color: "var(--text-muted)" }}>暂无产物</div>
+        <div>Agent 创建或修改文件后会出现在这里</div>
       </div>
     );
   }
 
+  // Newest first for “本轮结果” scanning
+  const ordered = [...outputArtifacts].reverse();
+  const active = ordered.find((item) => item.id === activeArtifactId) ?? ordered[0] ?? null;
+
   return (
     <div style={{ width: "100%", height: "100%", display: "grid", gridTemplateColumns: "220px minmax(0, 1fr)", minWidth: 0 }}>
       <div style={{ borderRight: "1px solid var(--border)", overflowY: "auto", background: "var(--bg-panel)" }}>
-        {outputArtifacts.map((item) => {
+        <div style={{ padding: "8px 10px 6px", fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--text-dim)" }}>
+          本轮产物 · {ordered.length}
+        </div>
+        {ordered.map((item) => {
           const selected = active?.id === item.id;
           return (
             <button
@@ -119,7 +126,7 @@ export function ArtifactsPanel({ artifacts, activeArtifactId, cwd, onSelectArtif
                 </div>
               ) : active.status === "pending" ? (
                 <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>
-                  Waiting for file output...
+                  等待文件输出…
                 </div>
               ) : active.beforeContent !== undefined && active.afterContent !== undefined ? (
                 <div style={{ width: "100%", height: "100%", overflow: "auto" }}>

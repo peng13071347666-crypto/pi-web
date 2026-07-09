@@ -873,30 +873,42 @@ function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?:
 }
 
 
+const TOOL_RESULT_PREVIEW_CHARS = 4000;
+
 function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number }) {
-  const [expanded, setExpanded] = useState(false);
+  // Default collapsed; auto-open only on error so noise stays low but failures are visible.
+  const isError = result?.isError ?? false;
+  const [expanded, setExpanded] = useState(isError);
+  const wasErrorRef = useRef(isError);
+  useEffect(() => {
+    if (isError && !wasErrorRef.current) setExpanded(true);
+    wasErrorRef.current = isError;
+  }, [isError]);
+
   const inputStr = JSON.stringify(block.input, null, 2);
 
-  // Result display
   const resultText = result
     ? result.content.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("\n")
     : null;
   const resultIsEmpty = resultText === null ? false : (resultText.trim() === "(no output)" || resultText.trim() === "");
-  const isError = result?.isError ?? false;
+  const pending = !result;
+  const statusLabel = isError ? "error" : pending ? "running" : resultIsEmpty ? "ok · empty" : "ok";
 
   return (
     <div
+      className="pi-tool-block"
       style={{
         borderRadius: "var(--content-radius)",
         overflow: "hidden",
         fontSize: 12,
-        border: isError ? "1px solid rgba(248,113,113,0.45)" : "1px solid rgba(34,197,94,0.25)",
+        border: isError ? "1px solid rgba(248,113,113,0.45)" : pending ? "1px solid color-mix(in srgb, var(--accent) 35%, var(--border))" : "1px solid rgba(34,197,94,0.25)",
         background: isError ? "rgba(248,113,113,0.05)" : "var(--tool-bg)",
       }}
     >
-      {/* ── Tool call header ── */}
       <button
+        type="button"
         onClick={() => setExpanded((v) => !v)}
+        title={expanded ? "收起工具详情" : "展开工具详情"}
         style={{
           display: "flex",
           alignItems: "center",
@@ -912,21 +924,29 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
           minWidth: 0,
         }}
       >
-        <span style={{ color: isError ? "#f87171" : "#16a34a", fontFamily: "var(--font-mono)", fontWeight: 600, fontSize: 11, flexShrink: 0 }}>
+        <span style={{ color: isError ? "#f87171" : pending ? "var(--accent)" : "#16a34a", fontFamily: "var(--font-mono)", fontWeight: 600, fontSize: 11, flexShrink: 0 }}>
           {block.toolName}
         </span>
         <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
           {getToolPreview(block)}
         </span>
-        {duration !== undefined && (
-          <span style={{ fontSize: 11, color: "var(--text-dim)", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
-        )}
+        <span
+          style={{
+            fontSize: 10,
+            flexShrink: 0,
+            fontVariantNumeric: "tabular-nums",
+            color: isError ? "#f87171" : pending ? "var(--accent)" : "var(--text-dim)",
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          {statusLabel}
+          {duration !== undefined ? ` · ${duration}s` : ""}
+        </span>
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
           <polyline points="2 3.5 5 6.5 8 3.5" />
         </svg>
       </button>
 
-      {/* ── Expanded: input args ── */}
       {expanded && (
         <pre
           style={{
@@ -936,6 +956,7 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
             fontSize: 12,
             lineHeight: 1.5,
             overflow: "auto",
+            maxHeight: 240,
             background: "var(--bg-subtle)",
             borderTop: isError ? "1px solid rgba(248,113,113,0.25)" : "1px solid rgba(34,197,94,0.2)",
             whiteSpace: "pre-wrap",
@@ -946,7 +967,6 @@ function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; re
         </pre>
       )}
 
-      {/* ── Paired result — only shown when expanded ── */}
       {expanded && result && (
         <PairedResult
           text={resultText ?? ""}
@@ -963,6 +983,10 @@ function PairedResult({ text, isEmpty, isError }: {
   isEmpty: boolean;
   isError: boolean;
 }) {
+  const [showAll, setShowAll] = useState(false);
+  const tooLong = text.length > TOOL_RESULT_PREVIEW_CHARS;
+  const display = !tooLong || showAll ? text : `${text.slice(0, TOOL_RESULT_PREVIEW_CHARS).trimEnd()}\n…`;
+
   return (
     <div
       style={{
@@ -978,7 +1002,7 @@ function PairedResult({ text, isEmpty, isError }: {
           fontSize: 12,
           lineHeight: 1.5,
           overflow: "auto",
-          maxHeight: 400,
+          maxHeight: showAll ? 560 : 320,
           background: "var(--assistant-bg)",
           whiteSpace: "pre-wrap",
           wordBreak: "break-all",
@@ -986,8 +1010,27 @@ function PairedResult({ text, isEmpty, isError }: {
           opacity: isEmpty ? 0.6 : 1,
         }}
       >
-        {isEmpty ? "(no output)" : text}
+        {isEmpty ? "(no output)" : display}
       </pre>
+      {tooLong && !isEmpty && (
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          style={{
+            width: "100%",
+            border: "none",
+            borderTop: "1px solid var(--border)",
+            background: "var(--bg-panel)",
+            color: "var(--text-muted)",
+            fontSize: 11,
+            padding: "5px 10px",
+            cursor: "pointer",
+            textAlign: "left",
+          }}
+        >
+          {showAll ? "收起输出" : `展开全部输出（${text.length.toLocaleString()} 字符）`}
+        </button>
+      )}
     </div>
   );
 }
