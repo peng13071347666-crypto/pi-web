@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "fs";
+import { readFile, stat as fsStat } from "fs/promises";
 import { join } from "path";
 import { SessionManager, buildSessionContext as piBuildSessionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage, SessionEntry, SessionInfo, SessionContext, SessionTreeNode, AssistantMessage, SessionHeader, UserMessage } from "./types";
@@ -107,10 +108,10 @@ function isInternalImageAttachment(filePath: string): boolean {
     || /^\/tmp\/codex-clipboard-[^/]+$/i.test(normalized);
 }
 
-function parseSessionFileForIndex(filePath: string, size: number, mtimeMs: number): CachedSessionRecord | null {
+async function parseSessionFileForIndex(filePath: string, size: number, mtimeMs: number): Promise<CachedSessionRecord | null> {
   let content: string;
   try {
-    content = readFileSync(filePath, "utf8");
+    content = await readFile(filePath, "utf8");
   } catch {
     return null;
   }
@@ -183,23 +184,37 @@ export async function listAllSessionRecords(): Promise<CachedSessionRecord[]> {
   const cache = getSessionIndexCache();
   const records: CachedSessionRecord[] = [];
 
+  // Process files in parallel batches to avoid blocking the event loop
+  const BATCH_SIZE = 20;
+  const toParse: Array<{ filePath: string; size: number; mtimeMs: number }> = [];
+
   for (const filePath of files) {
-    let stat;
+    let fileStat;
     try {
-      stat = statSync(filePath);
+      fileStat = await fsStat(filePath);
     } catch {
       continue;
     }
     const cached = cache.get(filePath);
-    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+    if (cached && cached.size === fileStat.size && cached.mtimeMs === fileStat.mtimeMs) {
       records.push(cached);
       continue;
     }
+    toParse.push({ filePath, size: fileStat.size, mtimeMs: fileStat.mtimeMs });
+  }
 
-    const parsed = parseSessionFileForIndex(filePath, stat.size, stat.mtimeMs);
-    if (!parsed) continue;
-    cache.set(filePath, parsed);
-    records.push(parsed);
+  // Parse uncached files in parallel batches
+  for (let i = 0; i < toParse.length; i += BATCH_SIZE) {
+    const batch = toParse.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(({ filePath, size, mtimeMs }) => parseSessionFileForIndex(filePath, size, mtimeMs))
+    );
+    for (let j = 0; j < results.length; j++) {
+      const parsed = results[j];
+      if (!parsed) continue;
+      cache.set(batch[j].filePath, parsed);
+      records.push(parsed);
+    }
   }
 
   for (const filePath of cache.keys()) {

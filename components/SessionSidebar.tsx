@@ -299,6 +299,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         }
         // Session not found — notify parent so it can show the placeholder
         onInitialRestoreDone?.();
+      } else if (!initialSessionId && !restoredRef.current) {
+        // No URL session param — auto-select the most recent session's cwd
+        // so the user lands on the homepage instead of "Get Started".
+        restoredRef.current = true;
+        const recentCwds = getRecentCwds(allSessions);
+        if (recentCwds.length > 0) {
+          setSelectedCwd(recentCwds[0]);
+        }
       }
     }
   }, [allSessions, selectedCwd, initialSessionId, onSelectSession, onInitialRestoreDone]);

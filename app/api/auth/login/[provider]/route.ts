@@ -1,4 +1,4 @@
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import { createAuthStorage } from "@/lib/auth-compat";
 
 export const dynamic = "force-dynamic";
 
@@ -57,9 +57,9 @@ export async function GET(
 
   const stream = new ReadableStream({
     async start(controller) {
-      const authStorage = AuthStorage.create();
+      const authStorage = createAuthStorage();
       const providers = authStorage.getOAuthProviders();
-      const providerInfo = providers.find((p) => p.id === provider);
+      const providerInfo = providers.find((p: any) => p.id === provider);
       if (!providerInfo) {
         send(controller, { type: "error", message: `Unknown provider: ${provider}` });
         controller.close();

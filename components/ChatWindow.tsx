@@ -376,48 +376,6 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                 </span>
               </div>
             </div>
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                gap: 8,
-                margin: "0 16px 14px",
-              }}
-            >
-              {[
-                { label: "解释这个项目", text: "请先快速了解当前项目结构与技术栈，用中文简要说明。" },
-                { label: "找 bug / 修问题", text: "帮我排查当前最可能的问题，先给结论再给改法。" },
-                { label: "写/改代码", text: "按最小改动原则实现下面需求：" },
-              ].map((item) => (
-                <button
-                  key={item.label}
-                  type="button"
-                  onClick={() => chatInputRef?.current?.insertIfEmpty(item.text)}
-                  style={{
-                    border: "1px solid var(--border)",
-                    background: "var(--bg-panel)",
-                    color: "var(--text-muted)",
-                    borderRadius: 999,
-                    padding: "6px 12px",
-                    fontSize: 12,
-                    cursor: "pointer",
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.borderColor = "var(--accent-border)";
-                    e.currentTarget.style.color = "var(--text)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.borderColor = "var(--border)";
-                    e.currentTarget.style.color = "var(--text-muted)";
-                  }}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-            <div style={{ margin: "0 16px 10px", fontSize: 11, color: "var(--text-dim)" }}>
-              Enter 发送 · Shift+Enter 换行 · Esc 中止 · / 命令
-            </div>
             <NoticeShelf notices={notices} align="right" />
             {chatInputElement}
           </div>

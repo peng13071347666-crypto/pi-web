@@ -1,0 +1,5 @@
+diff --git a/node_modules/@earendil-works/pi-coding-agent/package.json b/node_modules/@earendil-works/pi-coding-agent/package.json
+index 1234567..abcdefg 100644
+--- a/node_modules/@earendil-works/pi-coding-agent/package.json
++++ b/node_modules/@earendil-works/pi-coding-agent/package.json
+@@ exports section - add internal path access @@

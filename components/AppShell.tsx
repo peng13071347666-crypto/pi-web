@@ -241,7 +241,10 @@ export function AppShell() {
   }, []);
 
   const [initialSessionId] = useState<string | null>(() => searchParams.get("session"));
-  const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  const [activeCwd, setActiveCwd] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return localStorage.getItem("pi-web-last-cwd") || null;
+  });
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !searchParams.get("session"));
   // Suppresses sessionKey bump in handleCwdChange during the initial URL restore
@@ -249,6 +252,7 @@ export function AppShell() {
 
   const handleCwdChange = useCallback((cwd: string | null) => {
     setActiveCwd(cwd);
+    if (cwd) localStorage.setItem("pi-web-last-cwd", cwd);
     // Skip if cwd is null (initial mount) or during the initial URL restore.
     if (!cwd) return;
     if (suppressCwdBumpRef.current) {

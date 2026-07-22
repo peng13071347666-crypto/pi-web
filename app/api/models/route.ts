@@ -15,13 +15,36 @@ function compareModelEntries(
     || modelNameCollator.compare(a.id, b.id);
 }
 
+// ============================================================================
+// In-memory cache: avoids re-initializing the full model registry on every request.
+// Cache is keyed by cwd and invalidated after CACHE_TTL_MS or when ?refresh=1 is passed.
+// ============================================================================
+const CACHE_TTL_MS = 30_000; // 30 seconds
+
+type ModelsCacheEntry = {
+  timestamp: number;
+  data: {
+    models: Record<string, string>;
+    modelList: { id: string; name: string; provider: string; input?: string[] }[];
+    defaultModel: { provider: string; modelId: string } | null;
+    thinkingLevels: Record<string, string[]>;
+    thinkingLevelMaps: Record<string, Record<string, string | null>>;
+  };
+};
+
+declare global {
+  var __piModelsCache: Map<string, ModelsCacheEntry> | undefined;
+}
+
+function getModelsCache(): Map<string, ModelsCacheEntry> {
+  if (!globalThis.__piModelsCache) globalThis.__piModelsCache = new Map();
+  return globalThis.__piModelsCache;
+}
+
 export async function GET(req: Request) {
-  const nameMap = new Map<string, string>();
-  let modelList: { id: string; name: string; provider: string }[] = [];
-  let defaultModel: { provider: string; modelId: string } | null = null;
-  const thinkingLevels: Record<string, string[]> = {};
-  const thinkingLevelMaps: Record<string, Record<string, string | null>> = {};
-  const cwd = new URL(req.url).searchParams.get("cwd") || process.cwd();
+  const url = new URL(req.url);
+  const cwd = url.searchParams.get("cwd") || process.cwd();
+  const forceRefresh = url.searchParams.get("refresh") === "1";
 
   let cwdStat;
   try {
@@ -33,11 +56,26 @@ export async function GET(req: Request) {
     return Response.json({ error: `Not a directory: ${cwd}` }, { status: 400 });
   }
 
+  // Check cache
+  const cache = getModelsCache();
+  if (!forceRefresh) {
+    const cached = cache.get(cwd);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return Response.json(cached.data);
+    }
+  }
+
+  const nameMap = new Map<string, string>();
+  let modelList: { id: string; name: string; provider: string; input?: string[] }[] = [];
+  let defaultModel: { provider: string; modelId: string } | null = null;
+  const thinkingLevels: Record<string, string[]> = {};
+  const thinkingLevelMaps: Record<string, Record<string, string | null>> = {};
+
   try {
     const agentDir = getAgentDir();
     const services = await createAgentSessionServices({ cwd, agentDir });
-    const registry = services.modelRegistry;
-    const available = registry.getAvailable();
+    const runtime = services.modelRuntime;
+    const available = await runtime.getAvailable();
     modelList = available.map((m: { id: string; name: string; provider: string; input?: string[] }) => ({
       id: m.id,
       name: m.name,
@@ -58,13 +96,18 @@ export async function GET(req: Request) {
       defaultModel = { provider, modelId };
     }
   } catch (e) {
-    // Log the real cause so it's visible in the server console. Previously
-    // this was `catch { /* return empty */ }` which silently hid version-mismatch
-    // parse failures (e.g. models.json written by a newer pi than pi-web bundles).
-    // The /api/version-check banner surfaces the version diagnosis; here we at
-    // least keep the stack trace reachable for debugging.
     console.error("[api/models] failed to load model registry:", e);
   }
 
-  return Response.json({ models: Object.fromEntries(nameMap), modelList, defaultModel, thinkingLevels, thinkingLevelMaps });
+  const data = { models: Object.fromEntries(nameMap), modelList, defaultModel, thinkingLevels, thinkingLevelMaps };
+
+  // Store in cache
+  cache.set(cwd, { timestamp: Date.now(), data });
+  // Prevent unbounded growth
+  if (cache.size > 10) {
+    const oldest = cache.keys().next().value;
+    if (oldest) cache.delete(oldest);
+  }
+
+  return Response.json(data);
 }

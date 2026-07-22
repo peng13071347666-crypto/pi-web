@@ -57,9 +57,17 @@ export async function GET(
 
   const stream = new ReadableStream({
     start(controller) {
+      let closed = false;
+
       const encode = (data: unknown) => {
-        const text = `data: ${JSON.stringify(data)}\n\n`;
-        controller.enqueue(new TextEncoder().encode(text));
+        if (closed) return;
+        try {
+          const text = `data: ${JSON.stringify(data)}\n\n`;
+          controller.enqueue(new TextEncoder().encode(text));
+        } catch {
+          // controller already closed — mark and stop
+          closed = true;
+        }
       };
 
       // Send initial connected event
@@ -72,15 +80,23 @@ export async function GET(
       // Heartbeat every 30s to prevent server/proxy timeout (Next.js default ~120-150s)
       // Heartbeats do NOT count as agent activity / idle reset.
       const heartbeat = setInterval(() => {
+        if (closed) {
+          clearInterval(heartbeat);
+          return;
+        }
         try {
           controller.enqueue(new TextEncoder().encode(":\n\n"));
         } catch {
           // controller already closed
+          closed = true;
+          clearInterval(heartbeat);
         }
       }, 30_000);
 
       // Cleanup when client disconnects
       const cleanup = () => {
+        if (closed) return;
+        closed = true;
         clearInterval(heartbeat);
         unsubscribe();
         try {

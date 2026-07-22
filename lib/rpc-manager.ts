@@ -48,7 +48,7 @@ function readPositiveInt(envName: string, fallback: number): number {
 }
 
 const MAX_LIVE_SESSIONS = readPositiveInt("PI_WEB_MAX_LIVE", 3);
-const IDLE_TIMEOUT_MS = readPositiveInt("PI_WEB_IDLE_MS", 3 * 60 * 1000);
+const IDLE_TIMEOUT_MS = readPositiveInt("PI_WEB_IDLE_MS", 15 * 60 * 1000);
 const SSE_AUTOSTART = process.env.PI_WEB_SSE_AUTOSTART === "1";
 
 export function getRuntimePolicy() {
@@ -281,8 +281,8 @@ export class AgentSessionWrapper {
 
       case "set_model": {
         const { provider, modelId } = command as { provider: string; modelId: string };
-        const registry = this.inner.modelRegistry;
-        const model = registry.find(provider, modelId);
+        const model = this.inner.modelRuntime?.getModel(provider, modelId)
+          ?? this.inner.modelRegistry?.find(provider, modelId);
         if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
         await this.inner.setModel(model);
         return { id: model.id, provider: model.provider };
@@ -738,11 +738,16 @@ export async function startRpcSession(
     const multimodalProxyExtension = hasConfiguredMultimodalProxyPackage(settingsManager)
       ? null
       : resolveBundledPackageFile("pi-multimodal-proxy", MULTIMODAL_PROXY_EXTENSION_PARTS);
+    // Bundled skills shipped with pi-web (e.g. skill-finder for marketplace search)
+    const bundledSkillsDir = resolveBundledPackageFile("@agegr/pi-web", ["skills"])
+      ?? join(process.cwd(), "skills");
+
     const resourceLoader = new DefaultResourceLoader({
       cwd,
       agentDir,
       settingsManager,
       ...(multimodalProxyExtension ? { additionalExtensionPaths: [multimodalProxyExtension] } : {}),
+      additionalSkillPaths: [bundledSkillsDir],
       extensionsOverride: (base) => loadPiWebExtensions(base, agentDir),
     });
     await resourceLoader.reload();

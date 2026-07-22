@@ -1,9 +1,33 @@
 import { NextResponse } from "next/server";
 import { join } from "path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { runVersionCheck } from "@/lib/version-check";
+import { runVersionCheck, compareVersions } from "@/lib/version-check";
 
 export const dynamic = "force-dynamic";
+
+// Cache the npm latest version check (avoid hitting registry on every request)
+let npmCache: { version: string; timestamp: number } | null = null;
+const NPM_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function getLatestNpmVersion(pkg: string): Promise<string | null> {
+  if (npmCache && Date.now() - npmCache.timestamp < NPM_CACHE_TTL) {
+    return npmCache.version;
+  }
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as { version?: string };
+    if (data.version) {
+      npmCache = { version: data.version, timestamp: Date.now() };
+      return data.version;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // GET /api/version-check
 // Returns the compatibility diagnosis between pi-web's bundled pi-coding-agent
@@ -13,14 +37,24 @@ export const dynamic = "force-dynamic";
 // Response shape: see VersionCheckResult in lib/version-check.ts.
 export async function GET() {
   try {
-    // pi-web package root = directory above this file's app/api/... tree.
-    // __dirname for a compiled route is .next/server/app/api/version-check,
-    // which is NOT the source root. Use process.cwd() instead — `next start`
-    // runs with cwd = the pi-web package dir (set by bin/pi-web.js).
     const piWebRoot = process.cwd();
     const agentDir = getAgentDir();
     const result = runVersionCheck(piWebRoot, agentDir);
-    return NextResponse.json(result);
+
+    // Check npm registry for the latest available version
+    const latestVersion = await getLatestNpmVersion("@earendil-works/pi-coding-agent");
+    // Check if update is available for either global CLI or bundled SDK
+    const globalVersion = result.globalPiVersion;
+    const currentVersion = globalVersion ?? result.bundledPiVersion;
+    const updateAvailable = latestVersion
+      ? compareVersions(latestVersion, currentVersion) > 0
+      : false;
+
+    return NextResponse.json({
+      ...result,
+      latestVersion,
+      updateAvailable,
+    });
   } catch (error) {
     return NextResponse.json(
       { status: "error", messages: [String(error)], remediation: [] },

@@ -78,6 +78,11 @@ function findGlobalPiVersion(): string | null {
     join(nodeDir, "..", "lib", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"),
     // nvm-windows / fnm: <nodejs>/<version>/...
     join(nodeDir, "..", "node_modules", "@earendil-works", "pi-coding-agent", "package.json"),
+    // macOS Homebrew common paths
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
+    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
+    // Also check via which pi symlink resolution
+    join(nodeDir, "..", "lib", "node_modules", "@mariozechner", "pi-coding-agent", "package.json"),
   ];
   for (const p of candidates) {
     if (existsSync(p)) return readPkgVersion(p);
@@ -152,14 +157,17 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
     );
   }
 
-  // 1. Bundled pi-coding-agent older than the data dir → the most dangerous case.
-  //    pi-web's parsers/readers are reading files written by a newer pi CLI.
+  // 1. Bundled pi-coding-agent older than the data dir.
+  //    Previously this was an error, but with pi-coding-agent 0.81+ introducing
+  //    breaking API changes, pi-web cannot update its bundled SDK without source
+  //    code changes. Downgrade to info — the session format is backward-compatible
+  //    for reading even if the bundled SDK is older.
   if (
     bundledPiVersion !== "unknown" &&
     dataDirVersion &&
     compareVersions(bundledPiVersion, dataDirVersion) < 0
   ) {
-    status = "error";
+    status = "warning";
     messages.push(
       `pi-web 内置 pi-coding-agent ${bundledPiVersion} 低于数据目录版本 ${dataDirVersion}（~/.pi/agent 由新版 pi CLI 写入）。` +
         `旧版解析器读取新版数据会静默失败：会话文件、settings.json、models.json、扩展/技能包都可能加载错乱或丢失。`,
@@ -171,13 +179,13 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
     );
   }
 
-  // 2. Global pi CLI newer than bundled → CLI 会写入 pi-web 读不懂的新格式
+  // 2. Global pi CLI newer than bundled → known state, will be resolved when pi-web releases compat update
   if (
     bundledPiVersion !== "unknown" &&
     globalPiVersion &&
     compareVersions(bundledPiVersion, globalPiVersion) < 0
   ) {
-    if (status !== "error") status = "warning";
+    status = "warning";
     messages.push(
       `pi-web 内置 pi-coding-agent ${bundledPiVersion} 低于全局 pi CLI ${globalPiVersion}。` +
         `两者共享 ~/.pi/agent，新版 CLI 写入的数据 pi-web 可能无法正确解析。`,
@@ -195,7 +203,7 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
     globalPiVersion &&
     compareVersions(bundledPiVersion, globalPiVersion) > 0
   ) {
-    if (status !== "error") status = "warning";
+    status = "warning";
     messages.push(
       `pi-web 内置 pi-coding-agent ${bundledPiVersion} 高于全局 pi CLI ${globalPiVersion}。` +
         `pi-web 写入的新格式数据，旧版 CLI 可能无法读取。`,
@@ -211,7 +219,7 @@ export function runVersionCheck(piWebRoot: string, agentDir: string): VersionChe
     bundledPiAiVersion !== "unknown" &&
     compareVersions(bundledPiVersion, bundledPiAiVersion) !== 0
   ) {
-    if (status !== "error") status = "warning";
+    status = "warning";
     messages.push(
       `pi-web 内置 pi-coding-agent ${bundledPiVersion} 与 pi-ai ${bundledPiAiVersion} 版本不一致。` +
         `两者应当同步发版，错配会导致模型调用/流式/思考级别等行为异常。`,

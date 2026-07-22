@@ -1,9 +1,9 @@
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import { createAuthStorage } from "@/lib/auth-compat";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const authStorage = AuthStorage.create();
+  const authStorage = createAuthStorage();
   const providers = authStorage.getOAuthProviders();
 
   const EXCLUDED = new Set(["anthropic"]);
@@ -14,8 +14,8 @@ export async function GET() {
 
   const result = await Promise.all(
     providers
-      .filter((p) => !EXCLUDED.has(p.id))
-      .map(async (p) => {
+      .filter((p: any) => !EXCLUDED.has(p.id))
+      .map(async (p: any) => {
         const loggedIn = authStorage.has(p.id);
         return {
           id: p.id,

@@ -702,29 +702,44 @@ export function SkillsConfig({
                 </div>
               ) : (
                 (() => {
-                  const groups: { label: string; skills: typeof skills }[] = [];
-                  for (const grpLabel of ["project", "global", "path"]) {
-                    const grpSkills = skills.filter(
-                      (s) => sourceLabel(s) === grpLabel,
-                    );
-                    if (grpSkills.length > 0)
-                      groups.push({ label: grpLabel, skills: grpSkills });
-                  }
+                  const groups: { label: string; skills: typeof skills; emptyHint?: string }[] = [];
+                  const projectSkills = skills.filter((s) => sourceLabel(s) === "project");
+                  const globalSkills = skills.filter((s) => sourceLabel(s) === "global");
+                  const pathSkills = skills.filter((s) => sourceLabel(s) === "path");
+                  // Always show PROJECT and GLOBAL sections
+                  groups.push({
+                    label: "project",
+                    skills: projectSkills,
+                    emptyHint: projectSkills.length === 0 ? "No project skills — install via Add skill → project" : undefined,
+                  });
+                  groups.push({ label: "global", skills: globalSkills });
+                  if (pathSkills.length > 0) groups.push({ label: "path", skills: pathSkills });
                   return groups.map(
-                    ({ label: grpLabel, skills: grpSkills }) => (
+                    ({ label: grpLabel, skills: grpSkills, emptyHint }) => (
                       <div key={grpLabel} style={{ marginBottom: 6 }}>
                         <div
                           style={{
                             padding: "4px 8px 3px",
                             fontSize: 10,
                             fontWeight: 600,
-                            color: "var(--text-dim)",
+                            color: grpLabel === "project" ? "rgba(99,102,241,0.7)" : "var(--text-dim)",
                             textTransform: "uppercase",
                             letterSpacing: "0.06em",
                           }}
                         >
                           {grpLabel}
+                          {grpLabel === "project" && grpSkills.length > 0 && (
+                            <span style={{ marginLeft: 5, fontWeight: 400, opacity: 0.7 }}>({grpSkills.length})</span>
+                          )}
+                          {grpLabel === "global" && grpSkills.length > 0 && (
+                            <span style={{ marginLeft: 5, fontWeight: 400, opacity: 0.7 }}>({grpSkills.length})</span>
+                          )}
                         </div>
+                        {emptyHint && (
+                          <div style={{ padding: "4px 8px 6px", fontSize: 11, color: "var(--text-dim)", fontStyle: "italic" }}>
+                            {emptyHint}
+                          </div>
+                        )}
                         {grpSkills.map((skill) => {
                           const isSelected =
                             !addMode && selected === skill.filePath;

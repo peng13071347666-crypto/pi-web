@@ -24,6 +24,9 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "@earendil-works/pi-coding-agent/dist/core/auth-storage": [
+        "./node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage"
       ]
     },
     "target": "ES2017"

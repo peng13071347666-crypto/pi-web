@@ -169,7 +169,7 @@ const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
 const INITIAL_CONTEXT_LIMIT = 80;
 const CONTEXT_PAGE_LIMIT = 80;
-const SESSION_DETAIL_CACHE_MAX = 15;
+const SESSION_DETAIL_CACHE_MAX = 30;
 const sessionDetailCache = new Map<string, SessionCacheEntry>();
 
 function putSessionDetailCache(sid: string, entry: SessionCacheEntry): void {
@@ -1821,9 +1821,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     if (session) {
       sessionIdRef.current = session.id;
+      // Optimization: if we have cached leafId, start context load in parallel with session load
+      const cachedEntry = sessionDetailCache.get(session.id);
+      const cachedLeafId = cachedEntry?.data.leafId ?? null;
+      const contextPromise = cachedLeafId
+        ? loadContext(session.id, cachedLeafId, { limit: INITIAL_CONTEXT_LIMIT })
+        : null;
       loadSession(session.id, true, true, true).then((agentState) => {
-        const leafId = agentState?.leafId ?? sessionDetailCache.get(session.id)?.data.leafId ?? null;
-        void loadContext(session.id, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+        const leafId = agentState?.leafId ?? cachedLeafId;
+        // Only load context again if leafId changed from what we pre-loaded
+        if (!contextPromise || leafId !== cachedLeafId) {
+          void loadContext(session.id, leafId, { limit: INITIAL_CONTEXT_LIMIT });
+        }
         if (agentState?.running) {
           loadTools(session.id);
           if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
