@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentMessage, ArtifactItem, ExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { AgentMessage, ArtifactItem, AssistantContentBlock, AssistantMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolCallContent } from "@/lib/types";
 import { MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import type { OpenPathAction } from "./ArtifactCards";
@@ -68,6 +68,20 @@ function getMessageKey(msg: AgentMessage, entryId: string | undefined, idx: numb
   return `local:${msg.role}:${timestamp}:${idx}`;
 }
 
+type ExecutionDetailsGroup = {
+  key: string;
+  firstIndex: number;
+  lastIndex: number;
+  thinkingCount: number;
+  toolCount: number;
+  hasError: boolean;
+  assistantIndices: number[];
+};
+
+function isProcessBlock(block: AssistantContentBlock): boolean {
+  return block.type === "thinking" || block.type === "toolCall";
+}
+
 function Typewriter({ phrases }: { phrases: string[] }) {
   const [phraseIdx, setPhraseIdx] = useState(() => Math.floor(Math.random() * phrases.length));
   const [text, setText] = useState("");
@@ -102,9 +116,67 @@ function Typewriter({ phrases }: { phrases: string[] }) {
   );
 }
 
+function ExecutionDetailsToggle({
+  group,
+  expanded,
+  onToggle,
+}: {
+  group: ExecutionDetailsGroup;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const summary = [
+    group.thinkingCount > 0 ? `${group.thinkingCount} thinking` : null,
+    group.toolCount > 0 ? `${group.toolCount} tool${group.toolCount === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <div
+      className="pi-process-group"
+      style={{
+        marginBottom: 8,
+        border: group.hasError ? "1px solid rgba(248,113,113,0.45)" : "1px solid var(--border)",
+        borderRadius: "var(--content-radius)",
+        overflow: "hidden",
+        fontSize: 12,
+        background: group.hasError ? "rgba(248,113,113,0.05)" : "var(--bg-panel)",
+      }}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        title={expanded ? "收起全部执行过程" : "展开全部执行过程"}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          width: "100%",
+          padding: "6px 10px",
+          background: "none",
+          border: "none",
+          color: "var(--text-muted)",
+          cursor: "pointer",
+          fontSize: 12,
+          textAlign: "left",
+          minWidth: 0,
+        }}
+      >
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+          <polyline points="2 3.5 5 6.5 8 3.5" />
+        </svg>
+        <span style={{ flex: 1, minWidth: 0 }}>Execution details</span>
+        <span style={{ color: group.hasError ? "#f87171" : "var(--text-dim)", fontSize: 11, flexShrink: 0 }}>
+          {group.hasError ? `${summary} · error` : summary}
+        </span>
+      </button>
+    </div>
+  );
+}
+
 export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSessionStatsChange, onSessionStatsPanelOpen, onContextUsageChange, onArtifactsChange, onArtifactOpenRequest, onArtifactPreviewRequest, onReviewArtifactsRequest, onFilePreviewRequest, onOpenPathRequest }: Props) {
   const {
-    loading, error, messages, entryIds, streamState,
+    loading, error, messages, entryIds, streamState, activeLeafId, promptVariants,
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, sessionStats,
@@ -116,7 +188,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     isNew,
     messagesEndRef, scrollContainerRef,
     lastUserMsgRef, currentAssistantMsgRef,
-    handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
+    handleSend, handleEditMessage, handleAbort, handleFork, handleLeafChange, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, handleAgentEventRef,
@@ -233,6 +305,73 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     }
     return map;
   }, [messages]);
+
+  const executionDetails = useMemo(() => {
+    const groups: ExecutionDetailsGroup[] = [];
+    const byAssistantIndex = new Map<number, ExecutionDetailsGroup>();
+    let active: ExecutionDetailsGroup | null = null;
+
+    messages.forEach((msg, idx) => {
+      if (msg.role === "user") {
+        active = null;
+        return;
+      }
+      if (msg.role !== "assistant") return;
+
+      const processBlocks = (msg as AssistantMessage).content.filter(isProcessBlock);
+      if (processBlocks.length === 0) return;
+
+      if (!active) {
+        active = {
+          key: getMessageKey(msg, entryIds[idx], idx),
+          firstIndex: idx,
+          lastIndex: idx,
+          thinkingCount: 0,
+          toolCount: 0,
+          hasError: false,
+          assistantIndices: [],
+        };
+        groups.push(active);
+      }
+
+      active.lastIndex = idx;
+      active.assistantIndices.push(idx);
+      active.thinkingCount += processBlocks.filter((block) => block.type === "thinking").length;
+      active.toolCount += processBlocks.filter((block) => block.type === "toolCall").length;
+      active.hasError = active.hasError || processBlocks.some((block) => (
+        block.type === "toolCall"
+        && toolResultsMap.get((block as ToolCallContent).toolCallId)?.isError === true
+      ));
+      byAssistantIndex.set(idx, active);
+    });
+
+    return { groups, byAssistantIndex };
+  }, [messages, entryIds, toolResultsMap]);
+
+  const [executionDetailsExpanded, setExecutionDetailsExpanded] = useState<Record<string, boolean>>({});
+  const latestExecutionGroupKey = executionDetails.groups.at(-1)?.key ?? null;
+  const liveExecutionGroupKeyRef = useRef<string | null>(null);
+  const previousAgentRunningRef = useRef(agentRunning);
+
+  useEffect(() => {
+    if (agentRunning && latestExecutionGroupKey) {
+      liveExecutionGroupKeyRef.current = latestExecutionGroupKey;
+      setExecutionDetailsExpanded((prev) => prev[latestExecutionGroupKey] === true
+        ? prev
+        : { ...prev, [latestExecutionGroupKey]: true });
+    } else if (previousAgentRunningRef.current && !agentRunning && liveExecutionGroupKeyRef.current) {
+      const finishedGroupKey = liveExecutionGroupKeyRef.current;
+      setExecutionDetailsExpanded((prev) => ({ ...prev, [finishedGroupKey]: false }));
+      liveExecutionGroupKeyRef.current = null;
+    }
+    previousAgentRunningRef.current = agentRunning;
+  }, [agentRunning, latestExecutionGroupKey]);
+
+  useEffect(() => {
+    setExecutionDetailsExpanded({});
+    liveExecutionGroupKeyRef.current = null;
+    previousAgentRunningRef.current = agentRunning;
+  }, [session?.id]);
 
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !agentRunning;
 
@@ -441,10 +580,6 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
               let refIdx = 0;
               return messages.map((msg, idx) => {
                 const key = getMessageKey(msg, entryIds[idx], idx);
-                const prevAssistantEntryId =
-                  msg.role === "user" && idx > 0 && messages[idx - 1].role === "assistant"
-                    ? entryIds[idx - 1]
-                    : undefined;
                 const isVisible = msg.role === "user" || msg.role === "assistant";
                 const currentRefIdx = isVisible ? refIdx++ : -1;
                 let showTimestamp = false;
@@ -463,6 +598,32 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     showTimestamp = false;
                   }
                 }
+                const executionGroup = msg.role === "assistant"
+                  ? executionDetails.byAssistantIndex.get(idx)
+                  : undefined;
+                const executionExpanded = executionGroup
+                  ? executionDetailsExpanded[executionGroup.key] ?? (agentRunning && executionGroup.key === latestExecutionGroupKey)
+                  : undefined;
+                const executionDetailsMode: "collapsed" | "expanded" | undefined = executionGroup
+                  ? executionExpanded ? "expanded" : "collapsed"
+                  : undefined;
+                const executionDetailsControl = executionGroup?.firstIndex === idx
+                  ? (
+                    <ExecutionDetailsToggle
+                      group={executionGroup}
+                      expanded={Boolean(executionExpanded)}
+                      onToggle={() => setExecutionDetailsExpanded((prev) => ({
+                        ...prev,
+                        [executionGroup.key]: !executionExpanded,
+                      }))}
+                    />
+                  )
+                  : undefined;
+                const hiddenProcessOnlyMessage = msg.role === "assistant"
+                  && executionDetailsMode === "collapsed"
+                  && (msg as AssistantMessage).content.length > 0
+                  && (msg as AssistantMessage).content.every(isProcessBlock)
+                  && executionDetailsControl === undefined;
                 const view = (
                   <MessageView
                     key={key}
@@ -472,9 +633,10 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     entryId={entryIds[idx]}
                     onFork={agentRunning || isNew || (idx === 0 && msg.role === "user") ? undefined : handleFork}
                     forking={forkingEntryId === entryIds[idx]}
-                    onNavigate={agentRunning ? undefined : handleNavigate}
-                    prevAssistantEntryId={agentRunning ? undefined : prevAssistantEntryId}
-                    onEditContent={(content) => chatInputRef?.current?.insertIfEmpty(content)}
+                    onEditSubmit={agentRunning || isNew ? undefined : handleEditMessage}
+                    promptVariants={msg.role === "user" ? promptVariants[entryIds[idx]] : undefined}
+                    activeLeafId={activeLeafId}
+                    onSelectPromptVariant={agentRunning ? undefined : handleLeafChange}
                     showTimestamp={showTimestamp}
                     prevTimestamp={idx > 0 ? (messages[idx - 1] as import("@/lib/types").AgentMessage & { timestamp?: number }).timestamp : undefined}
                     artifacts={artifacts}
@@ -483,6 +645,8 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     onReviewArtifacts={onReviewArtifactsRequest}
                     onPreviewFile={onFilePreviewRequest}
                     onOpenPath={onOpenPathRequest}
+                    executionDetailsMode={executionDetailsMode}
+                    executionDetailsControl={executionDetailsControl}
                   />
                 );
                 if (!isVisible) return view;
@@ -491,7 +655,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
                     messageRefs.current[currentRefIdx] = el;
                     if (idx === lastUserIdx) { (lastUserMsgRef as { current: HTMLDivElement | null }).current = el; }
                     if (idx === answerStartAssistantIdx) { (currentAssistantMsgRef as { current: HTMLDivElement | null }).current = el; }
-                  }} style={{ contentVisibility: "auto", containIntrinsicSize: "220px" }}>
+                  }} style={{ contentVisibility: "auto", containIntrinsicSize: "220px", display: hiddenProcessOnlyMessage ? "none" : undefined }}>
                     {view}
                   </div>
                 );

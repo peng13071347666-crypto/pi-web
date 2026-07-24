@@ -282,6 +282,15 @@ export interface SessionContext {
   model: { provider: string; modelId: string } | null;
 }
 
+/** A user-prompt branch that can be selected without losing the other variants. */
+export interface PromptVariant {
+  entryId: string;
+  label: string;
+  leafIds: string[];
+}
+
+export type PromptVariantsByEntryId = Record<string, PromptVariant[]>;
+
 export type AttachedFilePreviewKind = "text" | "image" | "audio" | "pdf" | "docx" | "binary";
 
 export interface AttachedFileRef {

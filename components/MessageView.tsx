@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
+import type { ReactNode } from "react";
 import { MarkdownBody } from "./MarkdownBody";
 import { ArtifactCards, AttachedFileCards, type OpenPathAction } from "./ArtifactCards";
 import type {
@@ -15,6 +16,7 @@ import type {
   ImageContent,
   ToolCallContent,
   ThinkingContent,
+  PromptVariant,
 } from "@/lib/types";
 
 interface Props {
@@ -25,9 +27,14 @@ interface Props {
   entryId?: string;
   onFork?: (entryId: string) => void;
   forking?: boolean;
+  // Kept for compatibility with older callers; the inline editor supersedes it.
   onNavigate?: (entryId: string) => void;
   prevAssistantEntryId?: string;
   onEditContent?: (content: string) => void;
+  onEditSubmit?: (entryId: string, content: string) => Promise<void> | void;
+  promptVariants?: PromptVariant[];
+  activeLeafId?: string | null;
+  onSelectPromptVariant?: (leafId: string) => Promise<void> | void;
   showTimestamp?: boolean;
   prevTimestamp?: number;
   artifacts?: ArtifactItem[];
@@ -36,11 +43,24 @@ interface Props {
   onReviewArtifacts?: (artifactIds: string[]) => void;
   onPreviewFile?: (filePath: string) => void;
   onOpenPath?: (filePath: string, action: OpenPathAction) => void;
+  executionDetailsMode?: "collapsed" | "expanded";
+  executionDetailsControl?: ReactNode;
 }
 
 const USER_MESSAGE_COLLAPSE_CHAR_LIMIT = 1200;
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 18;
 const USER_MESSAGE_PREVIEW_CHAR_LIMIT = 1000;
+
+function isProcessBlock(block: AssistantContentBlock): boolean {
+  return block.type === "thinking" || block.type === "toolCall";
+}
+
+// Kept for the legacy component below; current chat rendering owns one
+// execution-details control per assistant turn in ChatWindow.
+type ProcessBlockItem = {
+  block: AssistantContentBlock;
+  index: number;
+};
 
 function formatTime(ts?: number): string | null {
   if (!ts) return null;
@@ -82,9 +102,10 @@ export function MessageView({
   entryId,
   onFork,
   forking,
-  onNavigate,
-  prevAssistantEntryId,
-  onEditContent,
+  onEditSubmit,
+  promptVariants,
+  activeLeafId,
+  onSelectPromptVariant,
   showTimestamp,
   prevTimestamp,
   artifacts,
@@ -93,6 +114,8 @@ export function MessageView({
   onReviewArtifacts,
   onPreviewFile,
   onOpenPath,
+  executionDetailsMode,
+  executionDetailsControl,
 }: Props) {
   if (message.role === "user") {
     return (
@@ -101,9 +124,10 @@ export function MessageView({
         entryId={entryId}
         onFork={onFork}
         forking={forking}
-        onNavigate={onNavigate}
-        prevAssistantEntryId={prevAssistantEntryId}
-        onEditContent={onEditContent}
+        onEditSubmit={onEditSubmit}
+        promptVariants={promptVariants}
+        activeLeafId={activeLeafId}
+        onSelectPromptVariant={onSelectPromptVariant}
         cwd={cwd}
         onPreviewFile={onPreviewFile}
         onOpenPath={onOpenPath}
@@ -125,6 +149,8 @@ export function MessageView({
         onReviewArtifacts={onReviewArtifacts}
         onPreviewFile={onPreviewFile}
         onOpenPath={onOpenPath}
+        executionDetailsMode={executionDetailsMode}
+        executionDetailsControl={executionDetailsControl}
       />
     );
   }
@@ -220,7 +246,7 @@ function getCollapsedUserMessageText(text: string): string {
   return text.slice(0, USER_MESSAGE_PREVIEW_CHAR_LIMIT).trimEnd();
 }
 
-function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, cwd, onPreviewFile, onOpenPath }: {
+function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, onEditSubmit, promptVariants, activeLeafId, onSelectPromptVariant, cwd, onPreviewFile, onOpenPath }: {
   message: UserMessage;
   entryId?: string;
   onFork?: (entryId: string) => void;
@@ -228,6 +254,10 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
   onNavigate?: (entryId: string) => void;
   prevAssistantEntryId?: string;
   onEditContent?: (content: string) => void;
+  onEditSubmit?: (entryId: string, content: string) => Promise<void> | void;
+  promptVariants?: PromptVariant[];
+  activeLeafId?: string | null;
+  onSelectPromptVariant?: (leafId: string) => Promise<void> | void;
   cwd?: string;
   onPreviewFile?: (filePath: string) => void;
   onOpenPath?: (filePath: string, action: OpenPathAction) => void;
@@ -235,6 +265,11 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
   const [hovered, setHovered] = useState(false);
   const [copied, setCopied] = useState(false);
   const [expandedLongContent, setExpandedLongContent] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const [variantSwitching, setVariantSwitching] = useState(false);
+  const editInputRef = useRef<HTMLTextAreaElement>(null);
 
   const rawContent =
     typeof message.content === "string"
@@ -259,17 +294,54 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
 
   const time = formatTime(message.timestamp);
   const canFork = !!entryId && !!onFork;
-  const canNavigate = !!prevAssistantEntryId && !!onNavigate;
+  const canNavigate = !!prevAssistantEntryId && !!onNavigate && !onEditSubmit;
+  const canEdit = !!entryId && !!onEditSubmit && !editSubmitting;
+  const variants = promptVariants && promptVariants.length > 1 ? promptVariants : [];
+  const activeVariantIndex = Math.max(0, variants.findIndex((variant) => variant.leafIds.includes(activeLeafId ?? "")));
 
   useEffect(() => {
     setExpandedLongContent(false);
   }, [content]);
+
+  useEffect(() => {
+    if (!editing) return;
+    setDraft(content);
+    requestAnimationFrame(() => {
+      editInputRef.current?.focus();
+      editInputRef.current?.select();
+    });
+  }, [content, editing]);
 
   const copyContent = () => {
     copyText(content).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     });
+  };
+
+  const submitEdit = async () => {
+    const next = draft.trim();
+    if (!entryId || !onEditSubmit || !next || editSubmitting) return;
+    setEditSubmitting(true);
+    try {
+      await onEditSubmit(entryId, draft);
+      setEditing(false);
+    } finally {
+      setEditSubmitting(false);
+    }
+  };
+
+  const selectVariant = async (delta: number) => {
+    if (!onSelectPromptVariant || variants.length < 2 || variantSwitching) return;
+    const nextIndex = (activeVariantIndex + delta + variants.length) % variants.length;
+    const targetLeafId = variants[nextIndex]?.leafIds.at(-1);
+    if (!targetLeafId) return;
+    setVariantSwitching(true);
+    try {
+      await onSelectPromptVariant(targetLeafId);
+    } finally {
+      setVariantSwitching(false);
+    }
   };
 
   return (
@@ -317,7 +389,60 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
               })}
             </div>
           )}
-          {content && (
+          {editing ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 260 }}>
+              <textarea
+                ref={editInputRef}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setEditing(false);
+                  } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    void submitEdit();
+                  }
+                }}
+                disabled={editSubmitting}
+                rows={Math.min(8, Math.max(3, draft.split("\n").length))}
+                style={{
+                  width: "min(620px, 70vw)",
+                  minHeight: 72,
+                  maxHeight: 240,
+                  resize: "vertical",
+                  padding: "8px 10px",
+                  border: "1px solid var(--accent)",
+                  borderRadius: "var(--control-radius)",
+                  background: "var(--bg-panel)",
+                  color: "var(--text)",
+                  font: "inherit",
+                  lineHeight: 1.5,
+                  outline: "none",
+                  boxSizing: "border-box",
+                }}
+              />
+              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6 }}>
+                <span style={{ marginRight: "auto", fontSize: 10, color: "var(--text-dim)" }}>Ctrl/⌘ + Enter to send</span>
+                <button
+                  type="button"
+                  onClick={() => setEditing(false)}
+                  disabled={editSubmitting}
+                  style={{ height: 26, padding: "0 9px", border: "1px solid var(--user-border)", borderRadius: "var(--control-radius)", background: "none", color: "var(--text-muted)", cursor: editSubmitting ? "not-allowed" : "pointer", fontSize: 11 }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void submitEdit()}
+                  disabled={editSubmitting || !draft.trim()}
+                  style={{ height: 26, padding: "0 10px", border: "none", borderRadius: "var(--control-radius)", background: editSubmitting || !draft.trim() ? "var(--border)" : "var(--accent)", color: editSubmitting || !draft.trim() ? "var(--text-dim)" : "#fff", cursor: editSubmitting || !draft.trim() ? "not-allowed" : "pointer", fontSize: 11, fontWeight: 600 }}
+                >
+                  {editSubmitting ? "Sending…" : "Send edited"}
+                </button>
+              </div>
+            </div>
+          ) : content ? (
             <>
               <MarkdownBody className="markdown-user-message">{displayedContent}</MarkdownBody>
               {contentIsCollapsible && (
@@ -341,7 +466,7 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
                 </button>
               )}
             </>
-          )}
+          ) : null}
           {!content && imageBlocks.length === 0 && hiddenAttachedFileCount > 0 && (
             <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
               {hiddenAttachedFileCount === 1 ? "Image attached" : `${hiddenAttachedFileCount} images attached`}
@@ -363,6 +488,46 @@ function UserMessageView({ message, entryId, onFork, forking, onNavigate, prevAs
           display: "flex", alignItems: "center", justifyContent: "flex-end",
           gap: 6, marginTop: 3,
         }}>
+          {variants.length > 1 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 2, marginRight: "auto" }}>
+              <button
+                type="button"
+                onClick={() => void selectVariant(-1)}
+                disabled={variantSwitching}
+                title="Previous prompt version"
+                aria-label="Previous prompt version"
+                style={{ width: 22, height: 22, padding: 0, border: "none", borderRadius: 5, background: "none", color: variantSwitching ? "var(--border)" : "var(--text-dim)", cursor: variantSwitching ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
+              </button>
+              <span title={variants[activeVariantIndex]?.label} style={{ minWidth: 28, textAlign: "center", fontSize: 10, color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>
+                {activeVariantIndex + 1}/{variants.length}
+              </span>
+              <button
+                type="button"
+                onClick={() => void selectVariant(1)}
+                disabled={variantSwitching}
+                title="Next prompt version"
+                aria-label="Next prompt version"
+                style={{ width: 22, height: 22, padding: 0, border: "none", borderRadius: 5, background: "none", color: variantSwitching ? "var(--border)" : "var(--text-dim)", cursor: variantSwitching ? "not-allowed" : "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg>
+              </button>
+            </div>
+          )}
+          {canEdit && !editing && (
+            <button
+              type="button"
+              onClick={() => setEditing(true)}
+              title="Edit and send as a new branch"
+              aria-label="Edit and send as a new branch"
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 26, height: 22, padding: 0, background: "none", border: "none", borderRadius: 5, color: "var(--text-dim)", cursor: "pointer" }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = "var(--accent)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z" /></svg>
+            </button>
+          )}
           <div style={{
             display: "flex", gap: 3,
             opacity: hovered ? 1 : 0,
@@ -481,6 +646,8 @@ function AssistantMessageView({
   onReviewArtifacts,
   onPreviewFile,
   onOpenPath,
+  executionDetailsMode,
+  executionDetailsControl,
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
@@ -494,6 +661,8 @@ function AssistantMessageView({
   onReviewArtifacts?: (artifactIds: string[]) => void;
   onPreviewFile?: (filePath: string) => void;
   onOpenPath?: (filePath: string, action: OpenPathAction) => void;
+  executionDetailsMode?: "collapsed" | "expanded";
+  executionDetailsControl?: ReactNode;
 }) {
   const time = showTimestamp ? formatTime(message.timestamp) : null;
   const blocks = useMemo(() => message.content ?? [], [message.content]);
@@ -553,6 +722,10 @@ function AssistantMessageView({
     () => new Set(messageArtifacts.map((artifact) => artifact.filePath)),
     [messageArtifacts]
   );
+  const processOnlyHidden = executionDetailsMode === "collapsed"
+    && blocks.length > 0
+    && blocks.every(isProcessBlock)
+    && messageArtifacts.length === 0;
 
   const copyContent = () => {
     copyText(textContent).then(() => {
@@ -615,6 +788,12 @@ function AssistantMessageView({
     return () => clearInterval(id);
   }, [isStreaming]);
 
+  if (processOnlyHidden) {
+    return executionDetailsControl ? (
+      <div style={{ marginBottom: 16 }}>{executionDetailsControl}</div>
+    ) : null;
+  }
+
   return (
     <div
       style={{ marginBottom: 16 }}
@@ -669,21 +848,26 @@ function AssistantMessageView({
         })()}
       </div>
 
+      {executionDetailsControl}
+
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {blocks.map((block, i) => (
-          <BlockView
-            key={i}
-            block={block}
-            toolResults={toolResults}
-            isStreaming={isStreaming}
-            streamingDuration={streamingDurations.get(i) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
-            toolCallDurations={toolCallDurations}
-            hiddenFilePaths={hiddenArtifactPaths}
-            cwd={cwd}
-            onPreviewFile={onPreviewFile}
-            onOpenPath={onOpenPath}
-          />
-        ))}
+        {blocks.map((block, i) => {
+          if (executionDetailsMode === "collapsed" && isProcessBlock(block)) return null;
+          return (
+            <BlockView
+              key={i}
+              block={block}
+              toolResults={toolResults}
+              isStreaming={isStreaming}
+              streamingDuration={streamingDurations.get(i) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
+              toolCallDurations={toolCallDurations}
+              hiddenFilePaths={hiddenArtifactPaths}
+              cwd={cwd}
+              onPreviewFile={onPreviewFile}
+              onOpenPath={onOpenPath}
+            />
+          );
+        })}
         {!isStreaming && (
           <ArtifactCards
             artifacts={messageArtifacts}
@@ -744,6 +928,111 @@ function AssistantMessageView({
   );
 }
 
+function ProcessBlockGroup({
+  items,
+  toolResults,
+  isStreaming,
+  streamingDurations,
+  thinkingDurationFromFile,
+  toolCallDurations,
+  hiddenFilePaths,
+  cwd,
+  onPreviewFile,
+  onOpenPath,
+}: {
+  items: ProcessBlockItem[];
+  toolResults?: Map<string, ToolResultMessage>;
+  isStreaming?: boolean;
+  streamingDurations: Map<number, number>;
+  thinkingDurationFromFile?: number;
+  toolCallDurations?: Map<string, number>;
+  hiddenFilePaths?: Set<string>;
+  cwd?: string;
+  onPreviewFile?: (filePath: string) => void;
+  onOpenPath?: (filePath: string, action: OpenPathAction) => void;
+}) {
+  const thinkingCount = items.filter(({ block }) => block.type === "thinking").length;
+  const toolCount = items.filter(({ block }) => block.type === "toolCall").length;
+  const hasError = items.some(({ block }) => {
+    if (block.type !== "toolCall") return false;
+    return toolResults?.get((block as ToolCallContent).toolCallId)?.isError === true;
+  });
+  const [expanded, setExpanded] = useState(Boolean(isStreaming) || hasError);
+  const wasStreamingRef = useRef(Boolean(isStreaming));
+
+  useEffect(() => {
+    if (hasError) setExpanded(true);
+    else if (wasStreamingRef.current && !isStreaming) setExpanded(false);
+    wasStreamingRef.current = Boolean(isStreaming);
+  }, [hasError, isStreaming]);
+
+  const summary = [
+    thinkingCount > 0 ? `${thinkingCount} thinking` : null,
+    toolCount > 0 ? `${toolCount} tool${toolCount === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <div
+      className="pi-process-group"
+      style={{
+        border: hasError ? "1px solid rgba(248,113,113,0.45)" : "1px solid var(--border)",
+        borderRadius: "var(--content-radius)",
+        overflow: "hidden",
+        fontSize: 12,
+        background: hasError ? "rgba(248,113,113,0.05)" : "var(--bg-panel)",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        title={expanded ? "收起执行过程" : "展开执行过程"}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          width: "100%",
+          padding: "6px 10px",
+          background: "none",
+          border: "none",
+          color: "var(--text-muted)",
+          cursor: "pointer",
+          fontSize: 12,
+          textAlign: "left",
+          minWidth: 0,
+        }}
+      >
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+          <polyline points="2 3.5 5 6.5 8 3.5" />
+        </svg>
+        <span style={{ flex: 1, minWidth: 0 }}>Execution details</span>
+        <span style={{ color: hasError ? "#f87171" : "var(--text-dim)", fontSize: 11, flexShrink: 0 }}>
+          {hasError ? "error" : summary}
+        </span>
+      </button>
+
+      {expanded && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "0 8px 8px", borderTop: "1px solid var(--border)" }}>
+          {items.map(({ block, index }) => (
+            <BlockView
+              key={index}
+              block={block}
+              toolResults={toolResults}
+              isStreaming={isStreaming}
+              streamingDuration={streamingDurations.get(index) ?? (block.type === "thinking" ? thinkingDurationFromFile : undefined)}
+              toolCallDurations={toolCallDurations}
+              hiddenFilePaths={hiddenFilePaths}
+              cwd={cwd}
+              onPreviewFile={onPreviewFile}
+              onOpenPath={onOpenPath}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BlockView({
   block,
   toolResults,
@@ -778,13 +1067,13 @@ function BlockView({
     );
   }
   if (block.type === "thinking") {
-    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} />;
+    return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} isStreaming={isStreaming} />;
   }
   if (block.type === "toolCall") {
     const tc = block as ToolCallContent;
     const result = toolResults?.get(tc.toolCallId);
     const duration = toolCallDurations?.get(tc.toolCallId);
-    return <ToolCallBlock block={tc} result={result} duration={duration} />;
+    return <ToolCallBlock block={tc} result={result} duration={duration} isStreaming={isStreaming} />;
   }
   return null;
 }
@@ -821,8 +1110,17 @@ function TextBlock({
   );
 }
 
-function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?: number }) {
+function ThinkingBlock({ block, duration, isStreaming }: { block: ThinkingContent; duration?: number; isStreaming?: boolean }) {
   const [expanded, setExpanded] = useState(false);
+  const wasStreamingRef = useRef(Boolean(isStreaming));
+
+  useEffect(() => {
+    // If the user opened the live thinking details, fold them when the
+    // assistant finishes so the completed answer remains the visual focus.
+    if (wasStreamingRef.current && !isStreaming) setExpanded(false);
+    wasStreamingRef.current = Boolean(isStreaming);
+  }, [isStreaming]);
+
   return (
     <div
       style={{
@@ -834,6 +1132,9 @@ function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?:
     >
       <button
         onClick={() => setExpanded((v) => !v)}
+        type="button"
+        aria-expanded={expanded}
+        title={expanded ? "收起思考详情" : "展开思考详情"}
         style={{
           display: "flex",
           alignItems: "center",
@@ -848,6 +1149,9 @@ function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?:
           textAlign: "left",
         }}
       >
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="var(--text-dim)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+          <polyline points="2 3.5 5 6.5 8 3.5" />
+        </svg>
         <span>Thinking</span>
         {duration !== undefined && (
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-dim)", fontVariantNumeric: "tabular-nums" }}>{duration}s</span>
@@ -875,15 +1179,22 @@ function ThinkingBlock({ block, duration }: { block: ThinkingContent; duration?:
 
 const TOOL_RESULT_PREVIEW_CHARS = 4000;
 
-function ToolCallBlock({ block, result, duration }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number }) {
+function ToolCallBlock({ block, result, duration, isStreaming }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; isStreaming?: boolean }) {
   // Default collapsed; auto-open only on error so noise stays low but failures are visible.
   const isError = result?.isError ?? false;
   const [expanded, setExpanded] = useState(isError);
   const wasErrorRef = useRef(isError);
+  const wasStreamingRef = useRef(Boolean(isStreaming));
   useEffect(() => {
     if (isError && !wasErrorRef.current) setExpanded(true);
     wasErrorRef.current = isError;
   }, [isError]);
+  useEffect(() => {
+    // Collapse any details opened while the run was live once the full
+    // assistant turn is complete. Keep errors open for quick diagnosis.
+    if (wasStreamingRef.current && !isStreaming && !isError) setExpanded(false);
+    wasStreamingRef.current = Boolean(isStreaming);
+  }, [isError, isStreaming]);
 
   const inputStr = JSON.stringify(block.input, null, 2);
 

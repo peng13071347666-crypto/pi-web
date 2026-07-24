@@ -9,6 +9,7 @@ import type {
   ExtensionStatusItem,
   ExtensionUiRequest,
   ExtensionWidgetItem,
+  PromptVariantsByEntryId,
   SessionInfo,
   SessionTreeNode,
   ToolCallContent,
@@ -24,6 +25,7 @@ export interface SessionData {
   filePath: string;
   tree: SessionTreeNode[];
   leafId: string | null;
+  promptVariants: PromptVariantsByEntryId;
   context: {
     messages: AgentMessage[];
     entryIds: string[];
@@ -156,7 +158,9 @@ export interface UseAgentSessionOptions {
   onArtifactOpenRequest?: (filePath: string) => void;
 }
 
-export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+// Pi can expose model-specific levels (for example `max` on GPT-5.6), so
+// keep this open-ended instead of freezing the UI to one SDK's current list.
+export type ThinkingLevelOption = string;
 
 const PROGRAMMATIC_SCROLL_IGNORE_MS = 700;
 const USER_SCROLL_INTENT_MS = 1200;
@@ -511,6 +515,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
   const newSessionPromotedRef = useRef(false);
   const promptRunIdRef = useRef(0);
+  const pendingEditEntryRef = useRef<string | null>(null);
   const loadSessionRequestRef = useRef(0);
   const loadSessionAbortRef = useRef<AbortController | null>(null);
   const loadContextRequestRef = useRef(0);
@@ -630,6 +635,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         filePath: d.filePath,
         tree: d.tree ?? [],
         leafId: d.leafId ?? null,
+        promptVariants: d.promptVariants ?? cached?.data.promptVariants ?? {},
         context: nextContext,
       };
       const nextMessages = d.context?.messages ?? cached?.messages ?? [];
@@ -1394,6 +1400,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length && !files?.length) return;
     if (agentRunning) return;
+    const editEntryId = pendingEditEntryRef.current;
+    pendingEditEntryRef.current = null;
     if (toolPreset === "none" && files?.length) {
       addNotice({ type: "warning", message: "Files were attached as paths. Enable tools if you want the model to read them." });
     }
@@ -1412,6 +1420,29 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         : messageForUi,
       timestamp: Date.now(),
     };
+
+    let preconnectedSessionId: string | null = null;
+    if (editEntryId && session && !isNew) {
+      try {
+        // Navigate to the edited user entry. pi changes the active leaf to
+        // that entry's parent, so the new prompt becomes a sibling branch.
+        await connectLive(session.id);
+        const navigation = await sendAgentCommand<{ cancelled?: boolean; leafId?: string | null }>(session.id, {
+          type: "navigate_tree",
+          targetId: editEntryId,
+        });
+        if (navigation?.cancelled) return;
+        const branchLeafId = navigation?.leafId ?? null;
+        setActiveLeafId(branchLeafId);
+        await loadContext(session.id, branchLeafId, { limit: INITIAL_CONTEXT_LIMIT });
+        preconnectedSessionId = session.id;
+      } catch (e) {
+        console.error("Failed to prepare edited prompt branch:", e);
+        addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+    }
+
     setMessages((prev) => [...prev, userMsg]);
     promptRunIdRef.current = promptRunId;
     agentRunningRef.current = true;
@@ -1476,7 +1507,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       } else if (session) {
         sentSessionId = session.id;
-        await connectLive(session.id);
+        if (preconnectedSessionId !== session.id) await connectLive(session.id);
         await sendAgentCommand(session.id, {
           type: "prompt",
           message: messageForAgent,
@@ -1493,7 +1524,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [activeModelSupportsImages, addNotice, isNew, newSessionCwd, newSessionModel, toolPreset, thinkingLevel, session, agentRunning, connectEvents, connectLive, promoteNewSession, waitForPromptSettlement]);
+  }, [activeModelSupportsImages, addNotice, connectEvents, connectLive, isNew, loadContext, newSessionCwd, newSessionModel, promoteNewSession, session, toolPreset, thinkingLevel, waitForPromptSettlement, agentRunning]);
+
+  const handleEditMessage = useCallback(async (entryId: string, content: string) => {
+    if (!content.trim() || agentRunning || agentRunningRef.current) return;
+    pendingEditEntryRef.current = entryId;
+    await handleSend(content);
+  }, [agentRunning, handleSend]);
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -1979,6 +2016,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, entryIds, streamState,
+    promptVariants: data?.promptVariants ?? {},
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, sessionStats,
@@ -1992,7 +2030,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     sessionIdRef, eventSourceRef, messagesEndRef, scrollContainerRef,
     lastUserMsgRef, currentAssistantMsgRef, pendingScrollToUserRef, pendingScrollToAssistantRef, initialScrollDoneRef,
     // Actions
-    handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
+    handleSend, handleEditMessage, handleAbort, handleFork, handleNavigate, handleLeafChange, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, loadMoreContext, setActiveLeafId, setData, setMessages,

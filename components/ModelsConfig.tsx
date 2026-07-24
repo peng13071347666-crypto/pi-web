@@ -148,19 +148,29 @@ type FetchedModelState =
   | { phase: "results"; models: FetchedModel[] }
   | { phase: "error"; message: string };
 
+type OfficialMatchState =
+  | { phase: "idle" }
+  | { phase: "matching" }
+  | { phase: "matched"; provider: string; name?: string; candidateCount: number }
+  | { phase: "not_found" }
+  | { phase: "error"; message: string };
+
 interface FetchedModel {
   id: string;
   name?: string;
+  api?: string;
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string | null>;
   input?: string[];
-  cost?: { input?: number; output?: number };
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  compat?: Record<string, unknown>;
 }
 
 type Selection =
   | { type: "provider"; name: string }
-  | { type: "model"; providerName: string; index: number }
+  | { type: "model"; providerName: string; index: number; autoMatch?: boolean }
   | { type: "oauth"; providerId: string }
   | { type: "apikey"; providerId: string };
 
@@ -189,8 +199,9 @@ const inputStyle = {
   boxSizing: "border-box" as const,
 };
 
-function TextInput({ value, onChange, placeholder, mono }: { value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean }) {
+function TextInput({ value, onChange, placeholder, mono, onBlur }: { value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean; onBlur?: React.FocusEventHandler<HTMLInputElement> }) {
   return <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+    onBlur={onBlur}
     style={{ ...inputStyle, fontFamily: mono ? "var(--font-mono)" : "inherit" }} />;
 }
 
@@ -356,7 +367,7 @@ function ProviderDetail({ name, provider, onChange, onRename, onDelete }: {
 
 // ── ThinkingLevelMap editor ───────────────────────────────────────────────────
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 type ThinkingLevel = typeof THINKING_LEVELS[number];
 
 const LEVEL_COLORS: Record<ThinkingLevel, string> = {
@@ -366,6 +377,7 @@ const LEVEL_COLORS: Record<ThinkingLevel, string> = {
   medium:  "#a78bfa",
   high:    "#f472b6",
   xhigh:   "#fb923c",
+  max:     "#f97316",
 };
 
 function ThinkingLevelMapEditor({
@@ -713,15 +725,19 @@ function ModelDetail({
   model,
   onChange,
   onDelete,
+  autoMatch = false,
 }: {
   providerName: string;
   provider: ProviderEntry;
   model: ModelEntry;
   onChange: (m: ModelEntry) => void;
   onDelete: () => void;
+  autoMatch?: boolean;
 }) {
   const [testState, setTestState] = useState<ModelTestState>({ phase: "idle" });
+  const [officialMatchState, setOfficialMatchState] = useState<OfficialMatchState>({ phase: "idle" });
   const [fetcherOpen, setFetcherOpen] = useState(false);
+  const autoMatchedIdRef = useRef("");
   const set = <K extends keyof ModelEntry>(k: K, v: ModelEntry[K]) => onChange({ ...model, [k]: v });
 
   const applyFetchedModel = useCallback((m: FetchedModel) => {
@@ -729,14 +745,54 @@ function ModelDetail({
       ...model,
       id: m.id,
       name: m.name ?? model.name,
+      api: model.api ?? m.api,
       contextWindow: m.contextWindow ?? model.contextWindow,
       maxTokens: m.maxTokens ?? model.maxTokens,
       reasoning: m.reasoning ?? model.reasoning,
+      thinkingLevelMap: m.thinkingLevelMap ?? model.thinkingLevelMap,
       input: m.input ?? model.input,
       cost: m.cost ? { ...model.cost, ...m.cost } : model.cost,
+      compat: m.compat ?? model.compat,
     };
     onChange(updated);
   }, [model, onChange]);
+
+  const matchOfficialModel = useCallback(async (force = false) => {
+    const modelId = model.id.trim();
+    if (!modelId || (!force && autoMatchedIdRef.current === modelId)) return;
+    autoMatchedIdRef.current = modelId;
+    setOfficialMatchState({ phase: "matching" });
+    try {
+      const res = await fetch("/api/models-config/match-model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ modelId, excludeProvider: providerName }),
+      });
+      const d = await res.json() as {
+        ok?: boolean;
+        match?: FetchedModel & { provider?: string };
+        matches?: Array<FetchedModel & { provider?: string }>;
+        error?: string;
+      };
+      if (!res.ok || !d.ok) {
+        setOfficialMatchState({ phase: "error", message: d.error ?? `HTTP ${res.status}` });
+        return;
+      }
+      if (!d.match) {
+        setOfficialMatchState({ phase: "not_found" });
+        return;
+      }
+      applyFetchedModel({ ...d.match, id: modelId });
+      setOfficialMatchState({
+        phase: "matched",
+        provider: d.match.provider ?? "pi",
+        name: d.match.name,
+        candidateCount: d.matches?.length ?? 1,
+      });
+    } catch (e) {
+      setOfficialMatchState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  }, [applyFetchedModel, model.id, providerName]);
   const costVal = (k: keyof NonNullable<ModelEntry["cost"]>) => model.cost?.[k] !== undefined ? String(model.cost[k]) : "";
   const setCost = (k: keyof NonNullable<ModelEntry["cost"]>, v: string) => {
     const n = parseFloat(v);
@@ -753,6 +809,17 @@ function ModelDetail({
       return ["Connected", ...meta, testState.responseText || null].filter(Boolean).join(" · ");
     }
     return ["Failed", ...meta, testState.message].filter(Boolean).join(" · ");
+  })();
+
+  const officialMatchSummary = (() => {
+    if (officialMatchState.phase === "idle") return null;
+    if (officialMatchState.phase === "matching") return "Matching pi built-in model metadata…";
+    if (officialMatchState.phase === "not_found") return "No matching pi built-in model found; you can fill the fields manually.";
+    if (officialMatchState.phase === "error") return `Auto-fill failed: ${officialMatchState.message}`;
+    const label = officialMatchState.name && officialMatchState.name !== model.id
+      ? `${officialMatchState.provider}/${officialMatchState.name}`
+      : officialMatchState.provider;
+    return `Matched ${label}${officialMatchState.candidateCount > 1 ? ` (${officialMatchState.candidateCount} candidates)` : ""}. Fields remain editable.`;
   })();
 
   useEffect(() => {
@@ -860,7 +927,35 @@ function ModelDetail({
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         <Field label="ID *">
           <div style={{ display: "flex", gap: 6 }}>
-            <TextInput value={model.id} onChange={(v) => set("id", v)} placeholder="model-id" mono />
+            <TextInput
+              value={model.id}
+              onChange={(v) => set("id", v)}
+              onBlur={() => { if (autoMatch) void matchOfficialModel(); }}
+              placeholder="model-id"
+              mono
+            />
+            <button
+              onClick={() => void matchOfficialModel(true)}
+              disabled={!model.id.trim() || officialMatchState.phase === "matching"}
+              title="Auto-fill matching pi built-in model metadata"
+              style={{
+                height: 30,
+                padding: "0 10px",
+                background: "var(--bg-panel)",
+                border: "1px solid var(--border)",
+                borderRadius: 5,
+                color: !model.id.trim() || officialMatchState.phase === "matching" ? "var(--text-dim)" : "var(--text-muted)",
+                cursor: !model.id.trim() || officialMatchState.phase === "matching" ? "not-allowed" : "pointer",
+                fontSize: 11,
+                whiteSpace: "nowrap",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                flexShrink: 0,
+              }}
+            >
+              {officialMatchState.phase === "matching" ? "Matching…" : "Auto-fill"}
+            </button>
             <button
               onClick={() => setFetcherOpen(true)}
               disabled={!provider.baseUrl}
@@ -890,6 +985,12 @@ function ModelDetail({
         </Field>
         <Field label="Name"><TextInput value={model.name ?? ""} onChange={(v) => set("name", v || undefined)} placeholder="Display name" /></Field>
       </div>
+
+      {officialMatchSummary && (
+        <div style={{ marginTop: -8, fontSize: 11, color: officialMatchState.phase === "error" ? "#f87171" : officialMatchState.phase === "matched" ? "#4ade80" : "var(--text-dim)" }}>
+          {officialMatchSummary}
+        </div>
+      )}
 
       <Field label="API override">
         <Select value={model.api ?? ""} onChange={(v) => set("api", v || undefined)} options={API_OPTIONS} />
@@ -1619,7 +1720,7 @@ export function ModelsConfig({ onClose }: { onClose: () => void }) {
     });
     setConfig((prev) => {
       const idx = (prev.providers?.[providerName]?.models?.length ?? 1) - 1;
-      setSelection({ type: "model", providerName, index: idx });
+      setSelection({ type: "model", providerName, index: idx, autoMatch: true });
       return prev;
     });
   }, []);
@@ -1703,6 +1804,7 @@ export function ModelsConfig({ onClose }: { onClose: () => void }) {
         providerName={selection.providerName}
         provider={provider}
         model={model}
+        autoMatch={selection.autoMatch}
         onChange={(m) => updateModel(selection.providerName, selection.index, m)}
         onDelete={() => removeModel(selection.providerName, selection.index)}
       />

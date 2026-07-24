@@ -23,7 +23,7 @@ export async function POST(req: Request, { params }: Params) {
       return NextResponse.json({ error: "apiKey is required" }, { status: 400 });
     }
     const authStorage = createAuthStorage();
-    authStorage.set(provider, { type: "api_key", key: apiKey.trim() });
+    await authStorage.modify(provider, async () => ({ type: "api_key", key: apiKey.trim() }));
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
@@ -34,7 +34,7 @@ export async function DELETE(_req: Request, { params }: Params) {
   const { provider } = await params;
   try {
     const authStorage = createAuthStorage();
-    authStorage.remove(provider);
+    await authStorage.delete(provider);
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });

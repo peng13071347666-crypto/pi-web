@@ -1,4 +1,4 @@
-import { createAuthStorage } from "@/lib/auth-compat";
+import { createModelRuntime } from "@/lib/auth-compat";
 
 export const dynamic = "force-dynamic";
 
@@ -7,11 +7,11 @@ export async function POST(
   { params }: { params: Promise<{ provider: string }> }
 ) {
   const { provider } = await params;
-  const authStorage = createAuthStorage();
-  const providers = authStorage.getOAuthProviders();
-  if (!providers.find((p: any) => p.id === provider)) {
+  const runtime = await createModelRuntime();
+  const providerInfo = runtime.getProvider(provider);
+  if (!providerInfo?.auth.oauth) {
     return Response.json({ error: `Unknown provider: ${provider}` }, { status: 400 });
   }
-  authStorage.logout(provider);
+  await runtime.logout(provider);
   return Response.json({ ok: true });
 }

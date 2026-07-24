@@ -7,10 +7,74 @@ import {
   invalidateSessionPathCache,
   buildSessionContext,
 } from "@/lib/session-reader";
+import type { PromptVariantsByEntryId } from "@/lib/types";
 import { getRpcSession } from "@/lib/rpc-manager";
+import type { SessionEntry, SessionTreeNode } from "@earendil-works/pi-coding-agent";
 
 // BranchNavigator still traverses recursively, so keep the response tree shallow.
 const MAX_PROJECTED_TREE_DEPTH = 200;
+
+function getPromptText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is { type: "text"; text: string } => {
+      return Boolean(block && typeof block === "object" && (block as { type?: unknown }).type === "text" && typeof (block as { text?: unknown }).text === "string");
+    })
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function promptLabel(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "(empty prompt)";
+  return normalized.length > 72 ? `${normalized.slice(0, 72).trimEnd()}…` : normalized;
+}
+
+function collectLeafIds(root: SessionTreeNode): string[] {
+  const leaves: string[] = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.children.length === 0) {
+      leaves.push(node.entry.id);
+      continue;
+    }
+    for (let i = node.children.length - 1; i >= 0; i--) {
+      stack.push(node.children[i]);
+    }
+  }
+  return leaves;
+}
+
+function isUserMessageNode(node: SessionTreeNode): node is SessionTreeNode & { entry: Extract<SessionEntry, { type: "message" }> } {
+  return node.entry.type === "message" && node.entry.message.role === "user";
+}
+
+/**
+ * Build the prompt-version index from the full session tree. Each group is a
+ * set of sibling user messages created from the same branch point; leaf IDs
+ * let the client switch to the corresponding completed answer without
+ * replacing any existing history.
+ */
+function buildPromptVariants(tree: SessionTreeNode[]): PromptVariantsByEntryId {
+  const variantsByEntryId: PromptVariantsByEntryId = {};
+  const stack: SessionTreeNode[][] = [tree];
+  while (stack.length > 0) {
+    const children = stack.pop()!;
+    const userChildren = children.filter(isUserMessageNode);
+    if (userChildren.length > 1) {
+      const variants = userChildren.map((node) => ({
+        entryId: node.entry.id,
+        label: promptLabel(getPromptText((node.entry.message as { content: unknown }).content)),
+        leafIds: collectLeafIds(node),
+      }));
+      for (const variant of variants) variantsByEntryId[variant.entryId] = variants;
+    }
+    for (const child of children) stack.push(child.children);
+  }
+  return variantsByEntryId;
+}
 
 /**
  * Project the session tree into the shallow navigation tree sent to the client.
@@ -125,7 +189,9 @@ export async function GET(
     const sm = SessionManager.open(filePath);
     const entries = metaOnly ? null : sm.getEntries() as never;
     const leafId = sm.getLeafId();
-    const tree = projectTreeForResponse(sm.getTree());
+    const fullTree = sm.getTree();
+    const tree = projectTreeForResponse(fullTree);
+    const promptVariants = buildPromptVariants(fullTree);
     const context = entries ? buildSessionContext(entries, leafId) : undefined;
 
     const header = sm.getHeader();
@@ -168,6 +234,7 @@ export async function GET(
       info,
       leafId,
       tree,
+      promptVariants,
       context,
       ...(agentState !== undefined ? { agentState } : {}),
     });

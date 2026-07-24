@@ -36,8 +36,8 @@ interface Props {
   compactResult?: CompactResultInfo | null;
   toolPreset?: "none" | "default" | "full";
   onToolPresetChange?: (preset: "none" | "default" | "full") => void;
-  thinkingLevel?: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  onThinkingLevelChange?: (level: "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh") => void;
+  thinkingLevel?: string;
+  onThinkingLevelChange?: (level: string) => void;
   availableThinkingLevels?: string[] | null;
   thinkingLevelMap?: Record<string, string | null> | null;
   retryInfo?: { attempt: number; maxAttempts: number; errorMessage?: string } | null;
@@ -90,8 +90,8 @@ function getImageMimeType(file: File): string {
   return IMAGE_MIME_BY_EXT[ext] ?? "image/png";
 }
 
-const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh"] as const;
-const THINKING_LEVEL_DESC: Record<typeof THINKING_LEVELS[number], string> = {
+const THINKING_LEVELS = ["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const THINKING_LEVEL_DESC: Record<string, string> = {
   auto: "沿用 pi 默认设置",
   off: "关闭推理",
   minimal: "最少推理",
@@ -99,7 +99,19 @@ const THINKING_LEVEL_DESC: Record<typeof THINKING_LEVELS[number], string> = {
   medium: "中等推理",
   high: "高强度推理",
   xhigh: "最高强度推理",
+  max: "最大强度推理",
 };
+
+function getThinkingLevels(availableThinkingLevels?: string[] | null): string[] {
+  if (!availableThinkingLevels) return [...THINKING_LEVELS];
+
+  const available = new Set(availableThinkingLevels);
+  const standard = THINKING_LEVELS.filter((level) => level === "auto" || available.has(level));
+  const extra = availableThinkingLevels.filter(
+    (level) => level.trim() && !(THINKING_LEVELS as readonly string[]).includes(level),
+  );
+  return [...standard, ...extra];
+}
 
 function formatTokenCount(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
@@ -1348,13 +1360,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                     borderRadius: "var(--popover-radius)", boxShadow: "var(--popover-shadow)",
                     overflow: "hidden", minWidth: 180,
                   }}>
-                    {THINKING_LEVELS.filter((lvl) => {
-                      if (!availableThinkingLevels) return true;
-                      if (lvl === "auto") return true;
-                      return availableThinkingLevels.includes(lvl);
-                    }).map((lvl) => {
+                    {getThinkingLevels(availableThinkingLevels).map((lvl) => {
                       const isActive = (thinkingLevel ?? "auto") === lvl;
-                      const desc = THINKING_LEVEL_DESC[lvl];
+                      const desc = THINKING_LEVEL_DESC[lvl] ?? "模型提供的自定义推理等级";
                       const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
                       const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
                       const showOriginal = mappedVal != null && mappedVal !== lvl;
